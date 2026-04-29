@@ -1,0 +1,3 @@
+Numero,Numero (Nota Fiscal),Quantidade de produtos,Valor total da venda,Observacoes internas,Codigo (SKU),Descricao do produto,Data da venda
+456789,987654,2,R$ 150.00,ABC12345,SKU001,Produto Exemplo A,01/03/2026
+789123,123456,1,R$ 89.90,"DEF98765,GHI54321",SKU002,Produto Exemplo B,02/03/2026
