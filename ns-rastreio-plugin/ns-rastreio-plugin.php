@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('NSR_PLUGIN_VERSION', '1.3.2');
+define('NSR_PLUGIN_VERSION', '1.4.0');
 define('NSR_PLUGIN_SLUG', 'ns-rastreio');
 
 /**
@@ -1064,6 +1064,94 @@ function nsr_handle_import_submission() {
 }
 
 /**
+ * Exporta toda a base para CSV no layout de importacao.
+ */
+function nsr_handle_export_csv() {
+    if (!current_user_can('manage_options')) {
+        wp_die('Permissao insuficiente para exportar dados.');
+    }
+
+    check_admin_referer('nsr_export_csv', 'nsr_export_nonce');
+
+    @set_time_limit(0);
+
+    $filename = 'ns-rastreio-export-' . gmdate('Ymd-His') . '.csv';
+
+    nocache_headers();
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename=' . $filename);
+
+    $output = fopen('php://output', 'w');
+    if ($output === false) {
+        wp_die('Nao foi possivel gerar o arquivo de exportacao.');
+    }
+
+    // BOM UTF-8 ajuda o Excel a abrir acentuacao corretamente.
+    fwrite($output, "\xEF\xBB\xBF");
+
+    fputcsv(
+        $output,
+        array(
+            'Numero',
+            'Numero (Nota Fiscal)',
+            'Quantidade de produtos',
+            'Valor total da venda',
+            'Observacoes internas',
+            'Codigo (SKU)',
+            'Descricao do produto',
+            'Data da venda',
+        ),
+        ';'
+    );
+
+    global $wpdb;
+    $table_name = nsr_get_table_name();
+    $batch_size = 2000;
+    $offset = 0;
+
+    while (true) {
+        $rows = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT pedido, nota_fiscal, quantidade, valor, ns, sku, descricao, data_venda
+                 FROM {$table_name}
+                 ORDER BY id ASC
+                 LIMIT %d OFFSET %d",
+                $batch_size,
+                $offset
+            ),
+            ARRAY_A
+        );
+
+        if (empty($rows)) {
+            break;
+        }
+
+        foreach ($rows as $row) {
+            fputcsv(
+                $output,
+                array(
+                    (string) $row['pedido'],
+                    (string) $row['nota_fiscal'],
+                    (string) $row['quantidade'],
+                    (string) $row['valor'],
+                    (string) $row['ns'],
+                    (string) $row['sku'],
+                    (string) $row['descricao'],
+                    (string) $row['data_venda'],
+                ),
+                ';'
+            );
+        }
+
+        $offset += $batch_size;
+    }
+
+    fclose($output);
+    exit;
+}
+add_action('admin_post_nsr_export_csv', 'nsr_handle_export_csv');
+
+/**
  * Renderiza pagina admin do plugin.
  */
 function nsr_render_admin_page() {
@@ -1110,7 +1198,15 @@ function nsr_render_admin_page() {
             </p>
         </form>
 
-        <h2>2) Teste rapido da consulta (admin)</h2>
+        <h2>2) Exportar planilha (migracao)</h2>
+        <p>Baixe um <code>.csv</code> com todos os registros no mesmo layout de importacao do plugin (ideal para levar para outra hospedagem).</p>
+        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-bottom:24px;">
+            <input type="hidden" name="action" value="nsr_export_csv" />
+            <?php wp_nonce_field('nsr_export_csv', 'nsr_export_nonce'); ?>
+            <button type="submit" class="button button-secondary">Exportar CSV completo</button>
+        </form>
+
+        <h2>3) Teste rapido da consulta (admin)</h2>
         <form method="get" style="display:flex;gap:8px;align-items:center;max-width:760px;flex-wrap:wrap;">
             <input type="hidden" name="page" value="<?php echo esc_attr(NSR_PLUGIN_SLUG); ?>" />
             <input type="text" name="nsr_admin_ns" value="<?php echo esc_attr($admin_search_value); ?>" placeholder="Digite o numero de serie (NS)" style="flex:1;" />
@@ -1167,7 +1263,7 @@ function nsr_render_admin_page() {
             </div>
         <?php endif; ?>
 
-        <h2>3) Consulta no site (navegador)</h2>
+        <h2>4) Consulta no site (navegador)</h2>
         <p>Crie uma pagina no WordPress e use o shortcode: <code>[ns_rastreio_consulta]</code>.</p>
     </div>
     <?php
