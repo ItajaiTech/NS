@@ -2,7 +2,7 @@
 
 Plugin para importar planilhas Excel/CSV e consultar numero de serie (NS) no navegador para obter informacoes completas do pedido.
 
-Versao atual: `1.3.2`
+Versao atual: `1.5.0`
 
 ## Requisitos
 
