@@ -1504,11 +1504,14 @@ function nsr_extract_kdt_items_from_pdf_text($text) {
     $normalized = strtoupper(remove_accents((string) $text));
     $normalized = preg_replace('/\s+/', ' ', $normalized);
 
-    // Captura sequencias como: PRD00040 7898722600065 988,00 UN
-    if (preg_match_all('/\b([A-Z]{2,}[A-Z0-9._\/-]{2,})\b\s+(?:\d{8,14}\s+)?(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{1,6})\s+UN\b/u', $normalized, $matches, PREG_SET_ORDER)) {
+    // Captura sequencias como: PRD00040 7898722600065 988,00 UN 210,00 207.480,00
+    // Grupos: (1) SKU  (2) Qtd  (3) Preco unitario (opcional)
+    $pattern = '/\b([A-Z]{2,}[A-Z0-9._\/-]{2,})\b\s+(?:\d{8,14}\s+)?(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{1,6})\s+UN\b(?:\s+(\d{1,3}(?:\.\d{3})*(?:,\d{2})?))?/u';
+    if (preg_match_all($pattern, $normalized, $matches, PREG_SET_ORDER)) {
         foreach ($matches as $m) {
             $sku = strtoupper((string) $m[1]);
             $qty = nsr_parse_quantity_value($m[2]);
+            $valor_str = isset($m[3]) ? trim($m[3]) : '';
 
             if (!nsr_is_probable_sku($sku) || $qty <= 0) {
                 continue;
@@ -1516,14 +1519,18 @@ function nsr_extract_kdt_items_from_pdf_text($text) {
 
             if (!isset($items[$sku])) {
                 $items[$sku] = array(
-                    'sku' => $sku,
+                    'sku'       => $sku,
                     'descricao' => '',
                     'quantidade' => 0,
-                    'scanned' => array(),
+                    'valor'     => '',
+                    'scanned'   => array(),
                 );
             }
 
             $items[$sku]['quantidade'] += $qty;
+            if ($valor_str !== '' && $items[$sku]['valor'] === '') {
+                $items[$sku]['valor'] = $valor_str;
+            }
         }
     }
 
@@ -1547,8 +1554,9 @@ function nsr_extract_order_from_pdf_text($text) {
         }
     }
 
-    $pedido = '';
+    $pedido      = '';
     $nota_fiscal = '';
+    $data_venda  = '';
 
     foreach ($lines as $line) {
         $norm = strtoupper(remove_accents($line));
@@ -1564,6 +1572,13 @@ function nsr_extract_order_from_pdf_text($text) {
         if ($nota_fiscal === '' && preg_match('/\b(?:NOTA\s+FISCAL|NF(?:E)?)\b[^0-9]{0,12}(\d{3,})/', $norm, $m)) {
             $nota_fiscal = $m[1];
         }
+
+        // Data do pedido: "Data  28/04/2026" ou "Data: 28/04/2026"
+        if ($data_venda === '' && preg_match('/\bDATA\b[^0-9]{0,5}(\d{2}\/\d{2}\/\d{4})/', $norm, $m)) {
+            // Converte DD/MM/YYYY -> YYYY-MM-DD para armazenamento padrao.
+            $parts = explode('/', $m[1]);
+            $data_venda = $parts[2] . '-' . $parts[1] . '-' . $parts[0];
+        }
     }
 
     $items = nsr_extract_kdt_items_from_pdf_text($text);
@@ -1571,9 +1586,10 @@ function nsr_extract_order_from_pdf_text($text) {
     // Fallback generico para outros formatos, caso o padrao KDT nao encontre itens.
     if (!empty($items)) {
         return array(
-            'pedido' => $pedido,
+            'pedido'      => $pedido,
             'nota_fiscal' => $nota_fiscal,
-            'itens' => $items,
+            'data_venda'  => $data_venda,
+            'itens'       => $items,
         );
     }
 
@@ -1625,9 +1641,10 @@ function nsr_extract_order_from_pdf_text($text) {
     }
 
     return array(
-        'pedido' => $pedido,
+        'pedido'      => $pedido,
         'nota_fiscal' => $nota_fiscal,
-        'itens' => $items,
+        'data_venda'  => $data_venda,
+        'itens'       => $items,
     );
 }
 
@@ -2189,12 +2206,13 @@ function nsr_handle_pdf_scan_workflow_submission() {
                         } else {
                             $token = nsr_generate_scan_session_token();
                             $session = array(
-                                'session_token' => $token,
-                                'pedido' => (string) $parsed['pedido'],
-                                'nota_fiscal' => (string) $parsed['nota_fiscal'],
+                                'session_token'  => $token,
+                                'pedido'         => (string) $parsed['pedido'],
+                                'nota_fiscal'    => (string) $parsed['nota_fiscal'],
+                                'data_venda'     => isset($parsed['data_venda']) ? (string) $parsed['data_venda'] : '',
                                 'origem_arquivo' => $safe_name,
-                                'itens' => $parsed['itens'],
-                                'missing_skus' => array(),
+                                'itens'          => $parsed['itens'],
+                                'missing_skus'   => array(),
                             );
 
                             $session = nsr_recompute_scan_session_flags($session);
@@ -2381,9 +2399,11 @@ function nsr_handle_pdf_scan_workflow_submission() {
                 $failed = false;
 
                 foreach ($session['itens'] as $sku => $item) {
-                    $descricao = isset($item['descricao']) ? (string) $item['descricao'] : '';
-                    $expected = (int) $item['quantidade'];
+                    $descricao   = isset($item['descricao']) ? (string) $item['descricao'] : '';
+                    $expected    = (int) $item['quantidade'];
+                    $valor_item  = isset($item['valor']) ? (string) $item['valor'] : '';
                     $scanned_list = isset($item['scanned']) && is_array($item['scanned']) ? $item['scanned'] : array();
+                    $data_venda  = (isset($session['data_venda']) && (string) $session['data_venda'] !== '') ? (string) $session['data_venda'] : date_i18n('Y-m-d');
 
                     foreach ($scanned_list as $ns) {
                         $ns_normalizado = nsr_normalize_lookup_value($ns);
@@ -2393,17 +2413,17 @@ function nsr_handle_pdf_scan_workflow_submission() {
                         }
 
                         $affected = nsr_upsert_ns_record(array(
-                            'ns' => $ns,
+                            'ns'             => $ns,
                             'ns_normalizado' => $ns_normalizado,
-                            'nota_fiscal' => (string) $session['nota_fiscal'],
-                            'pedido' => (string) $session['pedido'],
-                            'sku' => $sku,
-                            'descricao' => $descricao,
-                            'quantidade' => (string) $expected,
-                            'valor' => '',
-                            'data_venda' => '',
+                            'nota_fiscal'    => (string) $session['nota_fiscal'],
+                            'pedido'         => (string) $session['pedido'],
+                            'sku'            => $sku,
+                            'descricao'      => $descricao,
+                            'quantidade'     => (string) $expected,
+                            'valor'          => $valor_item,
+                            'data_venda'     => $data_venda,
                             'origem_arquivo' => (string) $session['origem_arquivo'],
-                            'linha_origem' => 0,
+                            'linha_origem'   => 0,
                         ));
 
                         if ($affected === false) {
@@ -2533,9 +2553,236 @@ function nsr_handle_export_csv() {
 }
 add_action('admin_post_nsr_export_csv', 'nsr_handle_export_csv');
 
-/**
- * Renderiza pagina admin do plugin.
- */
+// ============================================================
+// AJAX: Bipar NS (sem reload de pagina)
+// ============================================================
+function nsr_ajax_scan_ns() {
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(array('msg' => 'Permissao insuficiente.'), 403);
+    }
+
+    check_ajax_referer('nsr_ajax_scan', 'nonce');
+
+    $token = sanitize_text_field(wp_unslash(isset($_POST['token']) ? $_POST['token'] : ''));
+    $sku   = strtoupper(sanitize_text_field(wp_unslash(isset($_POST['sku']) ? $_POST['sku'] : '')));
+    $ns    = sanitize_text_field(wp_unslash(isset($_POST['ns']) ? $_POST['ns'] : ''));
+
+    $session = nsr_get_scan_session($token);
+    if (empty($session)) {
+        wp_send_json_error(array('msg' => 'Sessao nao encontrada ou expirada.'), 404);
+    }
+
+    $ns_normalizado = nsr_normalize_lookup_value($ns);
+    if ($sku === '' || $ns_normalizado === '') {
+        wp_send_json_error(array('msg' => 'Informe SKU e NS.'), 400);
+    }
+    if (!isset($session['itens'][$sku])) {
+        wp_send_json_error(array('msg' => 'SKU ' . $sku . ' nao faz parte do pedido.'), 400);
+    }
+
+    // Checa duplicidade em toda a sessao.
+    foreach ($session['itens'] as $item) {
+        $scanned = isset($item['scanned']) && is_array($item['scanned']) ? $item['scanned'] : array();
+        foreach ($scanned as $s) {
+            if (nsr_normalize_lookup_value($s) === $ns_normalizado) {
+                wp_send_json_error(array('msg' => 'NS ja bipado nesta sessao: ' . $ns), 409);
+            }
+        }
+    }
+
+    $expected = (int) $session['itens'][$sku]['quantidade'];
+    $already  = isset($session['itens'][$sku]['scanned']) ? count($session['itens'][$sku]['scanned']) : 0;
+    if ($already >= $expected) {
+        wp_send_json_error(array('msg' => sprintf('SKU %s ja atingiu a quantidade esperada (%d).', $sku, $expected)), 409);
+    }
+
+    if (!isset($session['itens'][$sku]['scanned']) || !is_array($session['itens'][$sku]['scanned'])) {
+        $session['itens'][$sku]['scanned'] = array();
+    }
+    $session['itens'][$sku]['scanned'][] = $ns;
+
+    // Persiste pedido/NF se vieram junto.
+    $pedido = sanitize_text_field(wp_unslash(isset($_POST['pedido']) ? $_POST['pedido'] : ''));
+    $nf     = sanitize_text_field(wp_unslash(isset($_POST['nota_fiscal']) ? $_POST['nota_fiscal'] : ''));
+    if ($pedido !== '') {
+        $session['pedido'] = $pedido;
+    }
+    if ($nf !== '') {
+        $session['nota_fiscal'] = $nf;
+    }
+
+    nsr_save_scan_session($token, $session);
+
+    $scanned_list  = $session['itens'][$sku]['scanned'];
+    $scanned_count = count($scanned_list);
+
+    wp_send_json_success(array(
+        'sku'           => $sku,
+        'ns'            => $ns,
+        'scanned_count' => $scanned_count,
+        'expected'      => $expected,
+        'is_ok'         => ($scanned_count === $expected),
+        'scanned_list'  => $scanned_list,
+    ));
+}
+add_action('wp_ajax_nsr_scan_ns', 'nsr_ajax_scan_ns');
+
+// AJAX: Remover NS
+function nsr_ajax_remove_ns() {
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(array('msg' => 'Permissao insuficiente.'), 403);
+    }
+
+    check_ajax_referer('nsr_ajax_scan', 'nonce');
+
+    $token = sanitize_text_field(wp_unslash(isset($_POST['token']) ? $_POST['token'] : ''));
+    $sku   = strtoupper(sanitize_text_field(wp_unslash(isset($_POST['sku']) ? $_POST['sku'] : '')));
+    $ns    = sanitize_text_field(wp_unslash(isset($_POST['ns']) ? $_POST['ns'] : ''));
+
+    $session = nsr_get_scan_session($token);
+    if (empty($session)) {
+        wp_send_json_error(array('msg' => 'Sessao nao encontrada.'), 404);
+    }
+
+    $removed = false;
+    if (isset($session['itens'][$sku]['scanned']) && is_array($session['itens'][$sku]['scanned'])) {
+        $idx = array_search($ns, $session['itens'][$sku]['scanned'], true);
+        if ($idx !== false) {
+            unset($session['itens'][$sku]['scanned'][$idx]);
+            $session['itens'][$sku]['scanned'] = array_values($session['itens'][$sku]['scanned']);
+            $removed = true;
+        }
+    }
+
+    if (!$removed) {
+        wp_send_json_error(array('msg' => 'NS nao encontrado.'), 404);
+    }
+
+    nsr_save_scan_session($token, $session);
+
+    $scanned_count = count($session['itens'][$sku]['scanned']);
+    $expected      = (int) $session['itens'][$sku]['quantidade'];
+
+    wp_send_json_success(array(
+        'sku'           => $sku,
+        'ns'            => $ns,
+        'scanned_count' => $scanned_count,
+        'expected'      => $expected,
+        'is_ok'         => ($scanned_count === $expected),
+        'scanned_list'  => $session['itens'][$sku]['scanned'],
+    ));
+}
+add_action('wp_ajax_nsr_remove_ns', 'nsr_ajax_remove_ns');
+
+// AJAX: Finalizar sessao
+function nsr_ajax_finalize_session() {
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(array('msg' => 'Permissao insuficiente.'), 403);
+    }
+
+    check_ajax_referer('nsr_ajax_scan', 'nonce');
+
+    $token = sanitize_text_field(wp_unslash(isset($_POST['token']) ? $_POST['token'] : ''));
+    $session = nsr_get_scan_session($token);
+    if (empty($session)) {
+        wp_send_json_error(array('msg' => 'Sessao nao encontrada.'), 404);
+    }
+
+    $pedido = sanitize_text_field(wp_unslash(isset($_POST['pedido']) ? $_POST['pedido'] : ''));
+    $nf     = sanitize_text_field(wp_unslash(isset($_POST['nota_fiscal']) ? $_POST['nota_fiscal'] : ''));
+    if ($pedido !== '') {
+        $session['pedido'] = $pedido;
+    }
+    if ($nf !== '') {
+        $session['nota_fiscal'] = $nf;
+    }
+
+    if (empty($session['pedido']) && empty($session['nota_fiscal'])) {
+        wp_send_json_error(array('msg' => 'Informe ao menos Pedido ou Nota Fiscal para finalizar.'), 400);
+    }
+
+    $session = nsr_recompute_scan_session_flags($session);
+    if (!empty($session['missing_skus'])) {
+        wp_send_json_error(array('msg' => 'SKU(s) sem cadastro: ' . implode(', ', $session['missing_skus'])), 400);
+    }
+
+    foreach ($session['itens'] as $sku => $item) {
+        $expected = (int) $item['quantidade'];
+        $scanned  = isset($item['scanned']) && is_array($item['scanned']) ? count($item['scanned']) : 0;
+        if ($expected !== $scanned) {
+            wp_send_json_error(array('msg' => sprintf('SKU %s: esperado %d, bipado %d.', $sku, $expected, $scanned)), 400);
+        }
+    }
+
+    global $wpdb;
+    $wpdb->query('START TRANSACTION');
+    $saved  = 0;
+    $failed = false;
+
+    foreach ($session['itens'] as $sku => $item) {
+        $descricao    = isset($item['descricao']) ? (string) $item['descricao'] : '';
+        $expected     = (int) $item['quantidade'];
+        $valor_item   = isset($item['valor']) ? (string) $item['valor'] : '';
+        $scanned_list = isset($item['scanned']) && is_array($item['scanned']) ? $item['scanned'] : array();
+        $origem       = isset($session['origem_arquivo']) ? (string) $session['origem_arquivo'] : '';
+        $data_venda   = (isset($session['data_venda']) && (string) $session['data_venda'] !== '') ? (string) $session['data_venda'] : date_i18n('Y-m-d');
+
+        foreach ($scanned_list as $ns) {
+            $ns_normalizado = nsr_normalize_lookup_value($ns);
+            if ($ns_normalizado === '') {
+                $failed = true;
+                break 2;
+            }
+
+            $affected = nsr_upsert_ns_record(array(
+                'ns'            => $ns,
+                'ns_normalizado' => $ns_normalizado,
+                'nota_fiscal'   => (string) $session['nota_fiscal'],
+                'pedido'        => (string) $session['pedido'],
+                'sku'           => $sku,
+                'descricao'     => $descricao,
+                'quantidade'    => (string) $expected,
+                'valor'         => $valor_item,
+                'data_venda'    => $data_venda,
+                'origem_arquivo'=> $origem,
+                'linha_origem'  => 0,
+            ));
+
+            if ($affected === false) {
+                $failed = true;
+                break 2;
+            }
+            $saved++;
+        }
+    }
+
+    if ($failed) {
+        $wpdb->query('ROLLBACK');
+        wp_send_json_error(array('msg' => 'Erro ao salvar registros. Nenhum dado foi gravado.'), 500);
+    }
+
+    $wpdb->query('COMMIT');
+    nsr_delete_scan_session($token);
+
+    wp_send_json_success(array(
+        'msg'   => sprintf('%d NS salvos com sucesso. Pedido: %s | NF: %s', $saved, $session['pedido'], $session['nota_fiscal']),
+        'saved' => $saved,
+    ));
+}
+add_action('wp_ajax_nsr_finalize_session', 'nsr_ajax_finalize_session');
+
+// AJAX: Cancelar sessao
+function nsr_ajax_cancel_session() {
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(array('msg' => 'Permissao insuficiente.'), 403);
+    }
+    check_ajax_referer('nsr_ajax_scan', 'nonce');
+    $token = sanitize_text_field(wp_unslash(isset($_POST['token']) ? $_POST['token'] : ''));
+    nsr_delete_scan_session($token);
+    wp_send_json_success(array('msg' => 'Sessao cancelada.'));
+}
+add_action('wp_ajax_nsr_cancel_session', 'nsr_ajax_cancel_session');
+
 function nsr_render_admin_page() {
     global $wpdb;
 
@@ -2630,76 +2877,29 @@ function nsr_render_admin_page() {
 
         <?php if (!empty($scan_session)) : ?>
             <?php
-            $scan_token = isset($scan_session['session_token']) ? (string) $scan_session['session_token'] : '';
+            $scan_token   = isset($scan_session['session_token']) ? (string) $scan_session['session_token'] : '';
             $missing_skus = isset($scan_session['missing_skus']) && is_array($scan_session['missing_skus']) ? $scan_session['missing_skus'] : array();
+            $ajax_nonce   = wp_create_nonce('nsr_ajax_scan');
             ?>
-            <div style="padding:12px;background:#fff;border:1px solid #dcdcde;border-radius:6px;margin-bottom:16px;">
-                <h3 style="margin:0 0 8px 0;">Previa da extracao do PDF</h3>
-                <p style="margin-top:0;">
-                    <strong>Arquivo:</strong> <?php echo esc_html(isset($scan_session['origem_arquivo']) ? $scan_session['origem_arquivo'] : ''); ?>
-                    | <strong>Pedido:</strong> <?php echo esc_html(isset($scan_session['pedido']) ? $scan_session['pedido'] : ''); ?>
-                    | <strong>NF:</strong> <?php echo esc_html(isset($scan_session['nota_fiscal']) ? $scan_session['nota_fiscal'] : ''); ?>
-                </p>
-
-                <table class="widefat" style="max-width:100%;margin-bottom:14px;">
-                    <thead>
-                        <tr>
-                            <th>SKU extraido</th>
-                            <th>Qtd extraida</th>
-                            <th>Descricao cadastro</th>
-                            <th>Status cadastro</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($scan_session['itens'] as $sku => $item) : ?>
-                            <tr>
-                                <td><?php echo esc_html($sku); ?></td>
-                                <td><?php echo esc_html((string) ((int) $item['quantidade'])); ?></td>
-                                <td><?php echo esc_html(isset($item['descricao']) ? $item['descricao'] : ''); ?></td>
-                                <td>
-                                    <?php if (in_array($sku, $missing_skus, true)) : ?>
-                                        <span style="color:#b32d2e;font-weight:600;">SKU nao cadastrado</span>
-                                    <?php else : ?>
-                                        <span style="color:#0a7d28;font-weight:600;">OK</span>
-                                    <?php endif; ?>
-                                </td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
-
-                <h3 style="margin:0 0 8px 0;">Bipagem de NS</h3>
-                <form method="post" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;">
-                    <?php wp_nonce_field('nsr_scan_action', 'nsr_scan_nonce'); ?>
-                    <input type="hidden" name="nsr_scan_session_token" value="<?php echo esc_attr($scan_token); ?>" />
-                    <label style="display:flex;align-items:center;gap:6px;">
-                        Pedido
-                        <input type="text" name="nsr_pedido" value="<?php echo esc_attr(isset($scan_session['pedido']) ? $scan_session['pedido'] : ''); ?>" />
-                    </label>
-                    <label style="display:flex;align-items:center;gap:6px;">
-                        Nota Fiscal
-                        <input type="text" name="nsr_nota_fiscal" value="<?php echo esc_attr(isset($scan_session['nota_fiscal']) ? $scan_session['nota_fiscal'] : ''); ?>" />
-                    </label>
-                    <label style="display:flex;align-items:center;gap:6px;">
-                        SKU
-                        <input type="text" name="nsr_scan_sku" placeholder="SKU" required />
-                    </label>
-                    <label style="display:flex;align-items:center;gap:6px;">
-                        NS
-                        <input type="text" name="nsr_scan_ns" placeholder="Numero de Serie" required />
-                    </label>
-                    <button type="submit" name="nsr_scan_add_submit" class="button button-primary">Bipar NS</button>
-                </form>
+            <div id="nsr-scan-panel" style="background:#fff;border:1px solid #dcdcde;border-radius:6px;padding:16px;margin-bottom:16px;">
+                <h3 style="margin:0 0 10px 0;">
+                    Previa do pedido &mdash;
+                    Arquivo: <span style="font-weight:normal;"><?php echo esc_html(isset($scan_session['origem_arquivo']) ? $scan_session['origem_arquivo'] : ''); ?></span>
+                    | Pedido: <span style="font-weight:normal;" id="nsr-hdr-pedido"><?php echo esc_html(isset($scan_session['pedido']) ? $scan_session['pedido'] : ''); ?></span>
+                    | NF: <span style="font-weight:normal;" id="nsr-hdr-nf"><?php echo esc_html(isset($scan_session['nota_fiscal']) ? $scan_session['nota_fiscal'] : ''); ?></span>
+                </h3>
 
                 <?php if (!empty($missing_skus)) : ?>
-                    <div style="padding:10px;background:#fff3cd;border:1px solid #ffc107;border-radius:4px;color:#856404;margin-bottom:10px;">
-                        SKU(s) sem cadastro de produto: <strong><?php echo esc_html(implode(', ', $missing_skus)); ?></strong>
+                    <div style="padding:8px 12px;background:#fff3cd;border:1px solid #ffc107;border-radius:4px;color:#856404;margin-bottom:10px;">
+                        SKU(s) sem cadastro: <strong><?php echo esc_html(implode(', ', $missing_skus)); ?></strong>
                     </div>
                 <?php endif; ?>
 
-                <table class="widefat striped" style="max-width:100%;margin-bottom:10px;">
+                <!-- Tabela de SKUs clicavel -->
+                <table class="widefat" id="nsr-sku-table" style="margin-bottom:14px;cursor:pointer;">
                     <thead>
                         <tr>
+                            <th></th>
                             <th>SKU</th>
                             <th>Descricao</th>
                             <th>Qtd Pedido</th>
@@ -2709,70 +2909,367 @@ function nsr_render_admin_page() {
                         </tr>
                     </thead>
                     <tbody>
-                        <?php
-                        $can_finalize = true;
-                        foreach ($scan_session['itens'] as $sku => $item) :
-                            $expected = (int) $item['quantidade'];
-                            $scanned_list = isset($item['scanned']) && is_array($item['scanned']) ? $item['scanned'] : array();
+                        <?php foreach ($scan_session['itens'] as $sku => $item) :
+                            $expected      = (int) $item['quantidade'];
+                            $scanned_list  = isset($item['scanned']) && is_array($item['scanned']) ? $item['scanned'] : array();
                             $scanned_count = count($scanned_list);
-                            $is_ok = ($expected === $scanned_count);
-                            if (!$is_ok) {
-                                $can_finalize = false;
-                            }
-                            if (in_array($sku, $missing_skus, true)) {
-                                $can_finalize = false;
-                            }
+                            $is_ok         = ($expected === $scanned_count);
+                            static $row_idx = 0;
+                            $row_idx++;
+                            $shortcut_key = $row_idx <= 9 ? $row_idx : null;
                             ?>
-                            <tr>
-                                <td><?php echo esc_html($sku); ?></td>
-                                <td><?php echo esc_html(isset($item['descricao']) ? $item['descricao'] : ''); ?></td>
-                                <td><?php echo esc_html((string) $expected); ?></td>
-                                <td><?php echo esc_html((string) $scanned_count); ?></td>
-                                <td>
-                                    <?php if ($is_ok) : ?>
-                                        <span style="color:#0a7d28;font-weight:600;">OK</span>
-                                    <?php else : ?>
-                                        <span style="color:#b32d2e;font-weight:600;">Divergente</span>
+                            <tr data-sku="<?php echo esc_attr($sku); ?>"
+                                data-expected="<?php echo esc_attr((string) $expected); ?>"
+                                onclick="nsrSelectSku(this)"
+                                style="transition:background .15s;">
+                                <td style="text-align:center;font-weight:600;width:30px;">
+                                    <?php if ($shortcut_key) : ?>
+                                        <span style="background:#2271b1;color:#fff;border-radius:3px;padding:2px 6px;font-size:12px;display:inline-block;"><?php echo esc_html((string) $shortcut_key); ?></span>
                                     <?php endif; ?>
                                 </td>
-                                <td>
-                                    <?php if (empty($scanned_list)) : ?>
-                                        -
+                                <td><strong><?php echo esc_html($sku); ?></strong></td>
+                                <td><?php echo esc_html(isset($item['descricao']) ? $item['descricao'] : ''); ?></td>
+                                <td><?php echo esc_html((string) $expected); ?></td>
+                                <td class="nsr-count"><?php echo esc_html((string) $scanned_count); ?></td>
+                                <td class="nsr-status">
+                                    <?php if ($is_ok) : ?>
+                                        <span style="color:#0a7d28;font-weight:600;">&#10003; OK</span>
                                     <?php else : ?>
-                                        <?php foreach ($scanned_list as $scanned_ns) : ?>
-                                            <form method="post" style="display:inline-block;margin:0 6px 6px 0;">
-                                                <?php wp_nonce_field('nsr_scan_action', 'nsr_scan_nonce'); ?>
-                                                <input type="hidden" name="nsr_scan_session_token" value="<?php echo esc_attr($scan_token); ?>" />
-                                                <input type="hidden" name="nsr_pedido" value="<?php echo esc_attr(isset($scan_session['pedido']) ? $scan_session['pedido'] : ''); ?>" />
-                                                <input type="hidden" name="nsr_nota_fiscal" value="<?php echo esc_attr(isset($scan_session['nota_fiscal']) ? $scan_session['nota_fiscal'] : ''); ?>" />
-                                                <input type="hidden" name="nsr_scan_remove_sku" value="<?php echo esc_attr($sku); ?>" />
-                                                <input type="hidden" name="nsr_scan_remove_ns" value="<?php echo esc_attr($scanned_ns); ?>" />
-                                                <button type="submit" name="nsr_scan_remove_submit" class="button button-small" title="Remover NS" style="padding:0 8px;line-height:1.6;">
-                                                    <?php echo esc_html($scanned_ns); ?> x
-                                                </button>
-                                            </form>
-                                        <?php endforeach; ?>
+                                        <span style="color:#b32d2e;font-weight:600;">Pendente</span>
                                     <?php endif; ?>
+                                </td>
+                                <td class="nsr-ns-list">
+                                    <?php foreach ($scanned_list as $sn) : ?>
+                                        <button type="button" class="button button-small nsr-remove-ns"
+                                            data-sku="<?php echo esc_attr($sku); ?>"
+                                            data-ns="<?php echo esc_attr($sn); ?>"
+                                            style="margin:1px 2px;"
+                                            onclick="event.stopPropagation();nsrRemoveNs(this)">
+                                            <?php echo esc_html($sn); ?> &times;
+                                        </button>
+                                    <?php endforeach; ?>
                                 </td>
                             </tr>
                         <?php endforeach; ?>
                     </tbody>
                 </table>
 
-                <form method="post" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-                    <?php wp_nonce_field('nsr_scan_action', 'nsr_scan_nonce'); ?>
-                    <input type="hidden" name="nsr_scan_session_token" value="<?php echo esc_attr($scan_token); ?>" />
-                    <input type="hidden" name="nsr_pedido" value="<?php echo esc_attr(isset($scan_session['pedido']) ? $scan_session['pedido'] : ''); ?>" />
-                    <input type="hidden" name="nsr_nota_fiscal" value="<?php echo esc_attr(isset($scan_session['nota_fiscal']) ? $scan_session['nota_fiscal'] : ''); ?>" />
-                    <button type="submit" name="nsr_scan_finalize_submit" class="button button-primary" <?php disabled(!$can_finalize || empty($scan_session['pedido']) && empty($scan_session['nota_fiscal'])); ?>>
+                <!-- Painel de bipagem AJAX -->
+                <div style="background:#f6f7f7;border:1px solid #dcdcde;border-radius:6px;padding:14px;margin-bottom:12px;">
+                    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:10px;">
+                        <label style="display:flex;flex-direction:column;gap:3px;font-size:13px;">
+                            Pedido
+                            <input type="text" id="nsr-inp-pedido" value="<?php echo esc_attr(isset($scan_session['pedido']) ? $scan_session['pedido'] : ''); ?>" style="width:120px;" />
+                        </label>
+                        <label style="display:flex;flex-direction:column;gap:3px;font-size:13px;">
+                            Nota Fiscal
+                            <input type="text" id="nsr-inp-nf" value="<?php echo esc_attr(isset($scan_session['nota_fiscal']) ? $scan_session['nota_fiscal'] : ''); ?>" style="width:120px;" />
+                        </label>
+                        <label style="display:flex;flex-direction:column;gap:3px;font-size:13px;">
+                            SKU ativo
+                            <input type="text" id="nsr-inp-sku" value="" readonly placeholder="Clique na tabela" style="width:140px;background:#fff;font-weight:600;" />
+                        </label>
+                        <label style="display:flex;flex-direction:column;gap:3px;font-size:13px;flex:1;min-width:200px;">
+                            Numero de Serie (NS)
+                            <input type="text" id="nsr-inp-ns" placeholder="Bipagem aqui..." autocomplete="off"
+                                style="font-size:15px;padding:6px;border:2px solid #2271b1;"
+                                onkeydown="if(event.key==='Enter'){event.preventDefault();nsrScanNs();}" />
+                        </label>
+                        <button type="button" class="button button-primary" onclick="nsrScanNs()" style="height:36px;align-self:flex-end;">
+                            Bipar NS
+                        </button>
+                    </div>
+
+                    <div id="nsr-scan-feedback" style="min-height:28px;font-weight:600;padding:4px 8px;border-radius:4px;display:none;"></div>
+                </div>
+
+                <!-- Botoes finalizar/cancelar -->
+                <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                    <button type="button" class="button button-primary" id="nsr-btn-finalize" onclick="nsrFinalize()">
                         Finalizar e salvar NS
                     </button>
-                    <button type="submit" name="nsr_scan_abort_submit" class="button">Cancelar sessao</button>
-                    <?php if (!$can_finalize) : ?>
-                        <span style="color:#b32d2e;">Nao e possivel finalizar: verifique SKUs e quantidades bipadas.</span>
-                    <?php endif; ?>
-                </form>
+                    <button type="button" class="button" id="nsr-btn-cancel" onclick="nsrCancel()">
+                        Cancelar sessao
+                    </button>
+                    <span id="nsr-finalize-msg" style="color:#b32d2e;"></span>
+                </div>
             </div>
+
+            <script>
+            (function(){
+                var TOKEN   = <?php echo wp_json_encode($scan_token); ?>;
+                var NONCE   = <?php echo wp_json_encode($ajax_nonce); ?>;
+                var AJAXURL = <?php echo wp_json_encode(admin_url('admin-ajax.php')); ?>;
+                var activeSku = null;
+
+                // ----- SKU selection -----
+                window.nsrSelectSku = function(row) {
+                    document.querySelectorAll('#nsr-sku-table tbody tr').forEach(function(r) {
+                        r.style.background = '';
+                        var badge = r.querySelector('td:first-child span');
+                        if(badge) badge.style.opacity = '0.5';
+                    });
+                    row.style.background = '#e5f0fb';
+                    var badge = row.querySelector('td:first-child span');
+                    if(badge) badge.style.opacity = '1';
+                    activeSku = row.dataset.sku;
+                    document.getElementById('nsr-inp-sku').value = activeSku;
+                    document.getElementById('nsr-inp-ns').focus();
+                };
+
+                // Auto-select first SKU that's not done
+                (function autoSelect(){
+                    var rows = document.querySelectorAll('#nsr-sku-table tbody tr');
+                    for(var i=0;i<rows.length;i++){
+                        var expected = parseInt(rows[i].dataset.expected,10);
+                        var count    = parseInt(rows[i].querySelector('.nsr-count').textContent,10);
+                        if(count < expected){ window.nsrSelectSku(rows[i]); return; }
+                    }
+                    if(rows.length) window.nsrSelectSku(rows[0]);
+                })();
+
+                // Atalhos de teclado: Num 1-9 para selecionar SKUs rapidamente
+                document.addEventListener('keydown', function(e){
+                    // Ignora se estiver digitando no input de NS
+                    if(document.activeElement.id === 'nsr-inp-ns') return;
+                    
+                    var key = e.key;
+                    if(key >= '1' && key <= '9'){
+                        var idx = parseInt(key, 10) - 1;
+                        var rows = document.querySelectorAll('#nsr-sku-table tbody tr');
+                        if(idx < rows.length){
+                            e.preventDefault();
+                            window.nsrSelectSku(rows[idx]);
+                        }
+                    }
+                });
+
+                function showFeedback(msg, type) {
+                    var el = document.getElementById('nsr-scan-feedback');
+                    el.textContent = msg;
+                    el.style.display = 'block';
+                    el.style.background = type === 'ok' ? '#d1fae5' : (type === 'warn' ? '#fff3cd' : '#fee2e2');
+                    el.style.color      = type === 'ok' ? '#065f46' : (type === 'warn' ? '#92400e' : '#7f1d1d');
+                    el.style.border     = '1px solid ' + (type === 'ok' ? '#6ee7b7' : (type === 'warn' ? '#fcd34d' : '#fca5a5'));
+                    clearTimeout(el._t);
+                    if (type === 'ok') {
+                        el._t = setTimeout(function(){ el.style.display='none'; }, 2500);
+                    }
+                }
+
+                function updateRow(data) {
+                    var row = document.querySelector('#nsr-sku-table tbody tr[data-sku="'+data.sku+'"]');
+                    if (!row) return;
+                    row.querySelector('.nsr-count').textContent   = data.scanned_count;
+                    var statusEl = row.querySelector('.nsr-status');
+                    statusEl.innerHTML = data.is_ok
+                        ? '<span style="color:#0a7d28;font-weight:600;">&#10003; OK</span>'
+                        : '<span style="color:#b32d2e;font-weight:600;">Pendente</span>';
+                    // Rebuild NS list
+                    var nsList = row.querySelector('.nsr-ns-list');
+                    nsList.innerHTML = '';
+                    data.scanned_list.forEach(function(sn){
+                        var btn = document.createElement('button');
+                        btn.type = 'button';
+                        btn.className = 'button button-small nsr-remove-ns';
+                        btn.dataset.sku = data.sku;
+                        btn.dataset.ns  = sn;
+                        btn.style.margin = '1px 2px';
+                        btn.textContent  = sn + ' \u00d7';
+                        btn.onclick = function(e){ e.stopPropagation(); window.nsrRemoveNs(btn); };
+                        nsList.appendChild(btn);
+                    });
+                    // Auto advance to next pending SKU
+                    if (data.is_ok && activeSku === data.sku) {
+                        var rows = document.querySelectorAll('#nsr-sku-table tbody tr');
+                        for(var i=0;i<rows.length;i++){
+                            if(parseInt(rows[i].querySelector('.nsr-count').textContent,10) <
+                               parseInt(rows[i].dataset.expected,10)){
+                                window.nsrSelectSku(rows[i]);
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                // ----- Bipar NS -----
+                window.nsrScanNs = function() {
+                    var ns = document.getElementById('nsr-inp-ns').value.trim();
+                    if (!activeSku || !ns) {
+                        showFeedback(activeSku ? 'Digite o NS.' : 'Selecione um SKU primeiro.', 'error');
+                        return;
+                    }
+                    var pedido = document.getElementById('nsr-inp-pedido').value.trim();
+                    var nf     = document.getElementById('nsr-inp-nf').value.trim();
+                    var fd = new FormData();
+                    fd.append('action',      'nsr_scan_ns');
+                    fd.append('nonce',       NONCE);
+                    fd.append('token',       TOKEN);
+                    fd.append('sku',         activeSku);
+                    fd.append('ns',          ns);
+                    fd.append('pedido',      pedido);
+                    fd.append('nota_fiscal', nf);
+                    fetch(AJAXURL, {method:'POST', body:fd})
+                        .then(function(r){ return r.json(); })
+                        .then(function(res){
+                            if (res.success) {
+                                document.getElementById('nsr-inp-ns').value = '';
+                                document.getElementById('nsr-inp-ns').focus();
+                                updateRow(res.data);
+                                showFeedback('NS ' + res.data.ns + ' bipado (' + res.data.scanned_count + '/' + res.data.expected + ')', 'ok');
+                                document.getElementById('nsr-hdr-pedido').textContent = pedido;
+                                document.getElementById('nsr-hdr-nf').textContent     = nf;
+                            } else {
+                                showFeedback(res.data.msg, 'error');
+                                document.getElementById('nsr-inp-ns').select();
+                            }
+                        })
+                        .catch(function(){ showFeedback('Erro de comunicacao com o servidor.', 'error'); });
+                };
+
+                // ----- Bipar múltiplos NSs (cola Ctrl+V) -----
+                window.nsrScanMultipleNs = function(nsList) {
+                    if (!activeSku) {
+                        showFeedback('Selecione um SKU primeiro.', 'error');
+                        return;
+                    }
+                    if (!Array.isArray(nsList) || nsList.length === 0) {
+                        showFeedback('Nenhum NS para bipar.', 'error');
+                        return;
+                    }
+
+                    var pedido = document.getElementById('nsr-inp-pedido').value.trim();
+                    var nf     = document.getElementById('nsr-inp-nf').value.trim();
+                    var processed = 0;
+                    var successful = 0;
+                    var failed = 0;
+
+                    function processNext() {
+                        if (processed >= nsList.length) {
+                            showFeedback(successful + ' NS bipados, ' + failed + ' erros.', failed === 0 ? 'ok' : 'warn');
+                            document.getElementById('nsr-inp-ns').focus();
+                            return;
+                        }
+
+                        var ns = nsList[processed++].trim();
+                        if (!ns) {
+                            setTimeout(processNext, 100);
+                            return;
+                        }
+
+                        var fd = new FormData();
+                        fd.append('action',      'nsr_scan_ns');
+                        fd.append('nonce',       NONCE);
+                        fd.append('token',       TOKEN);
+                        fd.append('sku',         activeSku);
+                        fd.append('ns',          ns);
+                        fd.append('pedido',      pedido);
+                        fd.append('nota_fiscal', nf);
+
+                        fetch(AJAXURL, {method:'POST', body:fd})
+                            .then(function(r){ return r.json(); })
+                            .then(function(res){
+                                if (res.success) {
+                                    updateRow(res.data);
+                                    successful++;
+                                    document.getElementById('nsr-hdr-pedido').textContent = pedido;
+                                    document.getElementById('nsr-hdr-nf').textContent     = nf;
+                                } else {
+                                    failed++;
+                                }
+                                setTimeout(processNext, 200);
+                            })
+                            .catch(function(){ failed++; setTimeout(processNext, 200); });
+                    }
+
+                    document.getElementById('nsr-inp-ns').value = '';
+                    showFeedback('Bipando ' + nsList.length + ' NS(s)...', 'warn');
+                    processNext();
+                };
+
+                // Event listener: paste Ctrl+V no campo de NS
+                document.getElementById('nsr-inp-ns').addEventListener('paste', function(e){
+                    e.preventDefault();
+                    var text = (e.clipboardData || window.clipboardData).getData('text');
+                    
+                    // Split por quebra de linha, espaço, vírgula, ponto-e-vírgula, pipe
+                    var nsList = text
+                        .split(/[\r\n,;|\s]+/)
+                        .map(function(s){ return s.trim(); })
+                        .filter(function(s){ return s.length > 0; });
+
+                    if (nsList.length === 1) {
+                        // Se só tem um NS, comporta-se normalmente
+                        document.getElementById('nsr-inp-ns').value = nsList[0];
+                    } else if (nsList.length > 1) {
+                        // Múltiplos NSs: bipar tudo
+                        window.nsrScanMultipleNs(nsList);
+                    }
+                });
+
+
+                // ----- Remover NS -----
+                window.nsrRemoveNs = function(btn) {
+                    if (!confirm('Remover NS ' + btn.dataset.ns + '?')) return;
+                    var fd = new FormData();
+                    fd.append('action', 'nsr_remove_ns');
+                    fd.append('nonce',  NONCE);
+                    fd.append('token',  TOKEN);
+                    fd.append('sku',    btn.dataset.sku);
+                    fd.append('ns',     btn.dataset.ns);
+                    fetch(AJAXURL, {method:'POST', body:fd})
+                        .then(function(r){ return r.json(); })
+                        .then(function(res){
+                            if (res.success) {
+                                updateRow(res.data);
+                                showFeedback('NS ' + res.data.ns + ' removido.', 'warn');
+                            } else {
+                                showFeedback(res.data.msg, 'error');
+                            }
+                        });
+                };
+
+                // ----- Finalizar -----
+                window.nsrFinalize = function() {
+                    var pedido = document.getElementById('nsr-inp-pedido').value.trim();
+                    var nf     = document.getElementById('nsr-inp-nf').value.trim();
+                    if (!pedido && !nf) {
+                        showFeedback('Informe Pedido ou Nota Fiscal.', 'error');
+                        return;
+                    }
+                    if (!confirm('Finalizar e salvar todos os NS?')) return;
+                    var fd = new FormData();
+                    fd.append('action',      'nsr_finalize_session');
+                    fd.append('nonce',       NONCE);
+                    fd.append('token',       TOKEN);
+                    fd.append('pedido',      pedido);
+                    fd.append('nota_fiscal', nf);
+                    fetch(AJAXURL, {method:'POST', body:fd})
+                        .then(function(r){ return r.json(); })
+                        .then(function(res){
+                            var panel = document.getElementById('nsr-scan-panel');
+                            if (res.success) {
+                                panel.innerHTML = '<div style="padding:16px;background:#d1fae5;border:1px solid #6ee7b7;border-radius:6px;color:#065f46;font-weight:600;font-size:15px;">' +
+                                    '&#10003; ' + res.data.msg + '</div>';
+                            } else {
+                                showFeedback(res.data.msg, 'error');
+                            }
+                        });
+                };
+
+                // ----- Cancelar -----
+                window.nsrCancel = function() {
+                    if (!confirm('Cancelar a sessao? Os NS bipados serao descartados.')) return;
+                    var fd = new FormData();
+                    fd.append('action', 'nsr_cancel_session');
+                    fd.append('nonce',  NONCE);
+                    fd.append('token',  TOKEN);
+                    fetch(AJAXURL, {method:'POST', body:fd})
+                        .then(function(r){ return r.json(); })
+                        .then(function(){ document.getElementById('nsr-scan-panel').remove(); });
+                };
+            })();
+            </script>
         <?php endif; ?>
 
         <h2>4) Exportar planilha (migracao)</h2>
