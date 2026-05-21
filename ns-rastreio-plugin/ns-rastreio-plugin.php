@@ -1980,6 +1980,99 @@ function nsr_find_by_ns($ns, $partial = false, $limit = 100) {
 }
 
 /**
+ * Busca registros para o painel admin por NS, NF ou Pedido.
+ *
+ * @param string $value
+ * @param string $search_type ns|nf|pedido
+ * @param bool $partial
+ * @param int $limit
+ * @return array
+ */
+function nsr_find_admin_records($value, $search_type = 'ns', $partial = false, $limit = 100) {
+    global $wpdb;
+
+    $value_raw = trim((string) $value);
+    $value_normalized = nsr_normalize_lookup_value($value_raw);
+    if ($value_raw === '' && $value_normalized === '') {
+        return array();
+    }
+
+    $search_type = strtolower(trim((string) $search_type));
+    $allowed_types = array(
+        'ns' => 'NS',
+        'nf' => 'NF',
+        'pedido' => 'Pedido',
+    );
+    if (!isset($allowed_types[$search_type])) {
+        $search_type = 'ns';
+    }
+
+    $table_name = nsr_get_table_name();
+    $limit = max(1, min(absint($limit), 500));
+
+    if ($search_type === 'ns') {
+        return nsr_find_by_ns($value_raw, $partial, $limit);
+    }
+
+    $column = ($search_type === 'nf') ? 'nota_fiscal' : 'pedido';
+
+    if ($partial) {
+        $like_raw = '%' . $wpdb->esc_like($value_raw) . '%';
+
+        if ($value_normalized !== '' && $value_normalized !== $value_raw) {
+            $like_normalized = '%' . $wpdb->esc_like($value_normalized) . '%';
+            $sql = $wpdb->prepare(
+                "SELECT ns, nota_fiscal, pedido, sku, descricao, quantidade, valor, data_venda, origem_arquivo, updated_at
+                 FROM {$table_name}
+                 WHERE {$column} LIKE %s OR {$column} LIKE %s
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT %d",
+                $like_raw,
+                $like_normalized,
+                $limit
+            );
+        } else {
+            $sql = $wpdb->prepare(
+                "SELECT ns, nota_fiscal, pedido, sku, descricao, quantidade, valor, data_venda, origem_arquivo, updated_at
+                 FROM {$table_name}
+                 WHERE {$column} LIKE %s
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT %d",
+                $like_raw,
+                $limit
+            );
+        }
+
+        return $wpdb->get_results($sql, ARRAY_A);
+    }
+
+    if ($value_normalized !== '' && $value_normalized !== $value_raw) {
+        $sql = $wpdb->prepare(
+            "SELECT ns, nota_fiscal, pedido, sku, descricao, quantidade, valor, data_venda, origem_arquivo, updated_at
+             FROM {$table_name}
+             WHERE {$column} = %s OR {$column} = %s
+             ORDER BY updated_at DESC, id DESC
+             LIMIT %d",
+            $value_raw,
+            $value_normalized,
+            $limit
+        );
+    } else {
+        $sql = $wpdb->prepare(
+            "SELECT ns, nota_fiscal, pedido, sku, descricao, quantidade, valor, data_venda, origem_arquivo, updated_at
+             FROM {$table_name}
+             WHERE {$column} = %s
+             ORDER BY updated_at DESC, id DESC
+             LIMIT %d",
+            ($value_normalized !== '') ? $value_normalized : $value_raw,
+            $limit
+        );
+    }
+
+    return $wpdb->get_results($sql, ARRAY_A);
+}
+
+/**
  * Registra menu administrativo.
  */
 function nsr_register_admin_menu() {
@@ -2810,10 +2903,20 @@ function nsr_render_admin_page() {
     $total_products = (int) $wpdb->get_var("SELECT COUNT(1) FROM {$products_table}");
 
     $admin_search_value = isset($_GET['nsr_admin_ns']) ? sanitize_text_field(wp_unslash($_GET['nsr_admin_ns'])) : '';
+    $admin_search_type = isset($_GET['nsr_admin_tipo']) ? sanitize_key(wp_unslash($_GET['nsr_admin_tipo'])) : 'ns';
+    if (!in_array($admin_search_type, array('ns', 'nf', 'pedido'), true)) {
+        $admin_search_type = 'ns';
+    }
+    $admin_search_label_map = array(
+        'ns' => 'NS',
+        'nf' => 'NF',
+        'pedido' => 'Pedido',
+    );
+    $admin_search_label = $admin_search_label_map[$admin_search_type];
     $admin_is_partial = (isset($_GET['nsr_admin_partial']) && $_GET['nsr_admin_partial'] === '1');
     $admin_results = array();
     if ($admin_search_value !== '') {
-        $admin_results = nsr_find_by_ns($admin_search_value, $admin_is_partial, 200);
+        $admin_results = nsr_find_admin_records($admin_search_value, $admin_search_type, $admin_is_partial, 200);
     }
     ?>
     <div class="wrap">
@@ -3283,12 +3386,17 @@ function nsr_render_admin_page() {
         <h2>5) Teste rapido da consulta (admin)</h2>
         <form method="get" style="display:flex;gap:8px;align-items:center;max-width:760px;flex-wrap:wrap;">
             <input type="hidden" name="page" value="<?php echo esc_attr(NSR_PLUGIN_SLUG); ?>" />
-            <input type="text" name="nsr_admin_ns" value="<?php echo esc_attr($admin_search_value); ?>" placeholder="Digite o numero de serie (NS)" style="flex:1;" />
+            <select name="nsr_admin_tipo">
+                <option value="ns" <?php selected($admin_search_type, 'ns'); ?>>NS</option>
+                <option value="nf" <?php selected($admin_search_type, 'nf'); ?>>NF</option>
+                <option value="pedido" <?php selected($admin_search_type, 'pedido'); ?>>Pedido</option>
+            </select>
+            <input type="text" name="nsr_admin_ns" value="<?php echo esc_attr($admin_search_value); ?>" placeholder="Digite NS, NF ou Pedido" style="flex:1;" />
             <label style="display:flex;align-items:center;gap:6px;">
                 <input type="checkbox" name="nsr_admin_partial" value="1" <?php checked($admin_is_partial); ?> />
                 Busca parcial
             </label>
-            <button type="submit" class="button">Buscar NS</button>
+            <button type="submit" class="button">Buscar</button>
         </form>
 
         <?php if ($admin_search_value !== '') : ?>
@@ -3329,8 +3437,8 @@ function nsr_render_admin_page() {
                     </table>
                 <?php else : ?>
                     <div style="padding:12px;background-color:#fff3cd;border:1px solid #ffc107;border-radius:4px;margin-top:8px;color:#856404;">
-                        <strong>⚠ NS não encontrado</strong><br/>
-                        Nenhum resultado encontrado para: <strong><?php echo esc_html($admin_search_value); ?></strong>
+                        <strong>⚠ <?php echo esc_html($admin_search_label); ?> não encontrado</strong><br/>
+                        Nenhum resultado encontrado para <?php echo esc_html($admin_search_label); ?>: <strong><?php echo esc_html($admin_search_value); ?></strong>
                         <br/><small style="display:block;margin-top:6px;">Verifique o valor digitado ou marque "Busca parcial" para procurar por trecho.</small>
                     </div>
                 <?php endif; ?>
