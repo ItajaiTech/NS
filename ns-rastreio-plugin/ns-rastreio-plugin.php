@@ -1294,6 +1294,100 @@ function nsr_pdf_extract_text_from_stream($stream) {
 }
 
 /**
+ * Extrai SKUs PRD diretamente do binario do PDF, sem depender do pdftotext.
+ *
+ * Util como ultimo recurso quando o pdftotext embaralha o texto por causa
+ * de layout colunar (PDFs com tabelas complexas em hospedagem Linux).
+ *
+ * @param string $file_path Caminho absoluto para o arquivo PDF.
+ * @return array Itens no mesmo formato de nsr_extract_kdt_items_from_pdf_text().
+ */
+function nsr_extract_skus_from_pdf_binary($file_path) {
+    $binary = @file_get_contents($file_path);
+    if ($binary === false || $binary === '') {
+        return array();
+    }
+
+    $items = array();
+
+    // Busca SKUs no formato literal do PDF: (PRD00069) ou texto plano PRD00069.
+    // PDFs gerados pelo Tiny/Bling costumam embutir os codigos como texto literal.
+    preg_match_all('/\(PRD(\d{5})\)/i', $binary, $matches_paren, PREG_OFFSET_CAPTURE);
+    preg_match_all('/(?<![A-Z0-9])(PRD\d{5})(?![A-Z0-9])/i', $binary, $matches_plain, PREG_OFFSET_CAPTURE);
+
+    $all_skus = array();
+
+    foreach ($matches_paren[0] as $idx => $m) {
+        $all_skus[] = array(
+            'sku'    => 'PRD' . strtoupper($matches_paren[1][$idx][0]),
+            'offset' => $m[1],
+        );
+    }
+
+    foreach ($matches_plain[0] as $idx => $m) {
+        $all_skus[] = array(
+            'sku'    => strtoupper($matches_plain[0][$idx][0]),
+            'offset' => $m[1],
+        );
+    }
+
+    foreach ($all_skus as $entry) {
+        $sku    = strtoupper(preg_replace('/[^A-Z0-9]/', '', $entry['sku']));
+        $offset = $entry['offset'];
+
+        if (!preg_match('/^PRD\d{5}$/', $sku)) {
+            continue;
+        }
+
+        // Ja encontrado com quantidade valida, pula duplicata.
+        if (isset($items[$sku]) && $items[$sku]['quantidade'] > 0) {
+            continue;
+        }
+
+        // Janela de 120 bytes apos o SKU para encontrar a quantidade.
+        $window = substr($binary, $offset + strlen($sku), 120);
+        $qty    = 0;
+
+        // Padrao: quantidade entre parenteses seguida de UN/UNID/UNIDADE no PDF literal.
+        if (preg_match('/\((\d{1,6}(?:[.,]\d{2})?)\)\s*(?:Tj|TJ)?\s*[^(]{0,20}\((?:UN|UNID|UNIDADE|UND|PC)\)/i', $window, $qm)) {
+            $qty = (int) str_replace(array('.', ','), array('', ''), $qm[1]);
+        }
+
+        // Padrao alternativo: numero com virgula/ponto antes de UN no texto corrido.
+        if ($qty <= 0 && preg_match('/(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?|\d{1,6})\s*(?:UN|UNID|UNIDADE|UND)\b/i', $window, $qm2)) {
+            $raw = preg_replace('/\.(?=\d{3})/', '', $qm2[1]); // remove separador de milhar
+            $raw = str_replace(',', '.', $raw);
+            $qty = (int) floatval($raw);
+        }
+
+        // Fallback: primeiro numero plausivel como quantidade na janela.
+        if ($qty <= 0 && preg_match_all('/\((\d{1,5})\)/', $window, $qm_all)) {
+            foreach ($qm_all[1] as $qv) {
+                $candidate = (int) $qv;
+                if ($candidate > 0 && $candidate <= 50000) {
+                    $qty = $candidate;
+                    break;
+                }
+            }
+        }
+
+        if ($qty <= 0 || $qty > 50000) {
+            continue;
+        }
+
+        $items[$sku] = array(
+            'sku'        => $sku,
+            'descricao'  => '',
+            'quantidade' => $qty,
+            'valor'      => '',
+            'scanned'    => array(),
+        );
+    }
+
+    return $items;
+}
+
+/**
  * Le texto bruto de PDF sem dependencias externas.
  *
  * @param string $file_path
@@ -1310,15 +1404,39 @@ function nsr_read_pdf_text($file_path) {
     }
 
     // Tenta usar pdftotext (Poppler) como metodo primario — lida com fontes customizadas/encodings.
-    $pdftotext_bin = plugin_dir_path(__FILE__) . 'bin/pdftotext.exe';
-    if (file_exists($pdftotext_bin) && function_exists('shell_exec')) {
-        $safe_input  = escapeshellarg((string) $file_path);
+    // Em Linux, prioriza binario do sistema; em Windows, usa binario embarcado no plugin.
+    if (function_exists('shell_exec')) {
+        $safe_input = escapeshellarg((string) $file_path);
         $safe_output = escapeshellarg('-');
-        // -layout preserva espacamento, -enc UTF-8 garante charset correto.
-        $cmd         = '"' . $pdftotext_bin . '" -layout -enc UTF-8 ' . $safe_input . ' ' . $safe_output . ' 2>NUL';
-        $result      = @shell_exec($cmd);
-        if ($result !== null && trim((string) $result) !== '') {
-            return trim((string) $result);
+        $binarios = nsr_get_pdftotext_binaries();
+        // CORRECAO: -raw primeiro para evitar embaralhamento de texto em PDFs com tabelas complexas.
+        // O -layout agrupa por posicao visual (colunar) e mistura SKU + Qtd + Preco da mesma linha.
+        // O -raw le em ordem de fluxo do documento (linha a linha), muito mais confiavel para tabelas.
+        $modes = array(
+            '-raw -enc UTF-8',                   // 1o: raw — leitura em ordem de fluxo (melhor para tabelas)
+            '-raw -nopgbrk -enc UTF-8',          // 2o: raw sem quebra de pagina
+            '-table -enc UTF-8',                 // 3o: modo tabela do Poppler (versao 0.89+)
+            '-tsv -enc UTF-8',                   // 4o: TSV com coordenadas (Poppler recente)
+            '-layout -enc UTF-8',                // 5o: layout como fallback
+            '-layout -nopgbrk -enc UTF-8',       // 6o: layout sem quebra de pagina
+        );
+
+        foreach ($binarios as $pdftotext_bin) {
+            foreach ($modes as $mode) {
+                $cmd = '"' . $pdftotext_bin . '" ' . $mode . ' ' . $safe_input . ' ' . $safe_output;
+                if (stripos(PHP_OS_FAMILY, 'Windows') === 0) {
+                    $cmd .= ' 2>NUL';
+                } else {
+                    $cmd .= ' 2>/dev/null';
+                }
+
+                $result = @shell_exec($cmd);
+                if ($result !== null && trim((string) $result) !== '') {
+                    // Salva caminho do PDF para uso no fallback binario
+                    $GLOBALS['nsr_current_pdf_path'] = $file_path;
+                    return trim((string) $result);
+                }
+            }
         }
     }
 
@@ -1440,6 +1558,66 @@ function nsr_read_pdf_text($file_path) {
 }
 
 /**
+ * Retorna possiveis caminhos do pdftotext conforme o sistema operacional.
+ *
+ * @return array
+ */
+function nsr_get_pdftotext_binaries() {
+    $paths = array();
+    $is_windows = (stripos(PHP_OS_FAMILY, 'Windows') === 0);
+
+    if ($is_windows) {
+        $windows_local = plugin_dir_path(__FILE__) . 'bin/pdftotext.exe';
+        if (file_exists($windows_local)) {
+            $paths[] = $windows_local;
+        }
+
+        $windows_common = array(
+            'C:\\Program Files\\poppler\\Library\\bin\\pdftotext.exe',
+            'C:\\Program Files (x86)\\poppler\\Library\\bin\\pdftotext.exe',
+        );
+
+        foreach ($windows_common as $candidate) {
+            if (file_exists($candidate)) {
+                $paths[] = $candidate;
+            }
+        }
+
+        return array_values(array_unique($paths));
+    }
+
+    $linux_common = array(
+        '/usr/bin/pdftotext',
+        '/usr/local/bin/pdftotext',
+        '/bin/pdftotext',
+    );
+
+    foreach ($linux_common as $candidate) {
+        if (is_executable($candidate)) {
+            $paths[] = $candidate;
+        }
+    }
+
+    // fallback por PATH quando nao encontramos caminho fixo.
+    $paths[] = 'pdftotext';
+
+    return array_values(array_unique($paths));
+}
+
+/**
+ * Identifica se token parece SKU valido.
+ *
+ * Regra de negocio: SKU deve seguir PRD + numeros.
+ *
+ * @param string $sku
+ * @return bool
+ */
+function nsr_is_valid_prd_sku($sku) {
+    $sku = strtoupper(trim((string) $sku));
+    return (bool) preg_match('/^PRD\d{5}$/', $sku);
+}
+
+/**
  * Identifica se token parece SKU valido.
  *
  * @param string $token
@@ -1447,11 +1625,12 @@ function nsr_read_pdf_text($file_path) {
  */
 function nsr_is_probable_sku($token) {
     $token = strtoupper(trim((string) $token));
-    if ($token === '' || strlen($token) < 3 || strlen($token) > 60) {
+    if ($token === '' || strlen($token) !== 8) {
         return false;
     }
 
-    if (!preg_match('/^[A-Z0-9._\/-]+$/', $token)) {
+    // Regra de negocio: SKU sempre inicia com PRD seguido de numeros.
+    if (!nsr_is_valid_prd_sku($token)) {
         return false;
     }
 
@@ -1493,6 +1672,448 @@ function nsr_parse_quantity_value($value) {
 }
 
 /**
+ * Aplica deslocamento alfabetico em caracteres A-Z/a-z.
+ *
+ * @param string $text
+ * @param int    $shift
+ * @return string
+ */
+function nsr_shift_alpha_text($text, $shift) {
+    $shift = (int) $shift % 26;
+    if ($shift === 0) {
+        return (string) $text;
+    }
+
+    $out = '';
+    $len = strlen((string) $text);
+    for ($i = 0; $i < $len; $i++) {
+        $ch = $text[$i];
+        $ord = ord($ch);
+
+        if ($ord >= 65 && $ord <= 90) {
+            $base = 65;
+            $out .= chr(($ord - $base + $shift + 26) % 26 + $base);
+            continue;
+        }
+
+        if ($ord >= 97 && $ord <= 122) {
+            $base = 97;
+            $out .= chr(($ord - $base + $shift + 26) % 26 + $base);
+            continue;
+        }
+
+        $out .= $ch;
+    }
+
+    return $out;
+}
+
+/**
+ * Recompacta palavras que vieram com um caractere por token no PDF.
+ * Ex.: "P R D 0 0 0 6 9" -> "PRD00069".
+ *
+ * @param string $text
+ * @return string
+ */
+function nsr_compact_spaced_char_tokens($text) {
+    $text = (string) $text;
+
+    return (string) preg_replace_callback(
+        '/\b(?:[A-Z0-9]\s+){2,}[A-Z0-9]\b/u',
+        function ($m) {
+            return str_replace(' ', '', (string) $m[0]);
+        },
+        $text
+    );
+}
+
+/**
+ * Corrige substituicoes comuns de OCR/texto ruidoso em PDFs.
+ *
+ * Exemplos:
+ * 3EDIDO -> PEDIDO | 9ENDA -> VENDA | &LIENTE -> CLIENTE | 4TD -> QTD
+ *
+ * @param string $text
+ * @return string
+ */
+function nsr_decode_noisy_ocr_text($text) {
+    $text = strtoupper(remove_accents((string) $text));
+
+    $map = array(
+        '&' => 'C',
+        '$' => 'A',
+        '3' => 'P',
+        '9' => 'V',
+        '4' => 'Q',
+        '8' => 'U',
+        '7' => 'T',
+        '1|' => 'N',
+        '1/' => 'N',
+        '|' => 'I',
+        'µ' => 'O',
+        '©' => 'C',
+    );
+
+    return str_replace(array_keys($map), array_values($map), $text);
+}
+
+/**
+ * Decodifica tokens com substituicoes comuns vistas em alguns PDFs na hospedagem.
+ * Mantem numeros puros (quantidades/valores) sem alteracao.
+ *
+ * @param string $text
+ * @return string
+ */
+function nsr_decode_obfuscated_pdf_text($text) {
+    $text = strtoupper(remove_accents((string) $text));
+    $tokens = preg_split('/(\s+)/u', $text, -1, PREG_SPLIT_DELIM_CAPTURE);
+    if (!is_array($tokens)) {
+        return $text;
+    }
+
+    // Mapeamento observado no fornecedor/hospedagem (ex.: 3RECO -> PRECO, 4TD -> QTD).
+    $map = array(
+        '&' => 'C',
+        '*' => 'G',
+        '$' => 'A',
+        '©' => 'C',
+        'µ' => 'O',
+        '|' => 'I',
+        '\\' => 'I',
+    );
+
+    $digit_map = array(
+        '0' => 'O',
+        '1' => 'N',
+        '2' => 'O',
+        '3' => 'P',
+        '4' => 'Q',
+        '5' => 'R',
+        '6' => 'S',
+        '7' => 'T',
+        '8' => 'U',
+        '9' => 'V',
+    );
+
+    foreach ($tokens as $idx => $token) {
+        if (trim((string) $token) === '') {
+            continue;
+        }
+
+        // Mantem numeros puros (inteiros/decimais) para nao quebrar quantidades.
+        if (preg_match('/^\d+(?:[\.,]\d+)?$/', $token)) {
+            continue;
+        }
+
+        // Mantem tokens que ja parecem SKU PRD para nao corromper digitos.
+        if (preg_match('/^PRD[A-Z0-9]{2,}$/', $token)) {
+            continue;
+        }
+
+        $chars = preg_split('//u', (string) $token, -1, PREG_SPLIT_NO_EMPTY);
+        if (!is_array($chars)) {
+            continue;
+        }
+
+        $rebuilt = '';
+        $count = count($chars);
+
+        for ($i = 0; $i < $count; $i++) {
+            $ch = (string) $chars[$i];
+            $prev = $i > 0 ? (string) $chars[$i - 1] : '';
+            $next = $i + 1 < $count ? (string) $chars[$i + 1] : '';
+
+            if (isset($map[$ch])) {
+                $rebuilt .= $map[$ch];
+                continue;
+            }
+
+            if (isset($digit_map[$ch])) {
+                $prev_is_digit = preg_match('/\d/u', $prev) === 1;
+                $next_is_digit = preg_match('/\d/u', $next) === 1;
+
+                // Troca digito por letra apenas quando estiver em contexto alfanumerico,
+                // evitando alterar sequencias numericas reais de quantidade/valor.
+                if (!$prev_is_digit || !$next_is_digit) {
+                    $prev_is_letter = preg_match('/[A-Z]/u', $prev) === 1;
+                    $next_is_letter = preg_match('/[A-Z]/u', $next) === 1;
+                    if ($prev_is_letter || $next_is_letter) {
+                        $rebuilt .= $digit_map[$ch];
+                        continue;
+                    }
+                }
+            }
+
+            $rebuilt .= $ch;
+        }
+
+        $tokens[$idx] = $rebuilt;
+    }
+
+    return implode('', $tokens);
+}
+
+/**
+ * Gera candidatos de texto para parser de PDF (original + fallback decifrado).
+ *
+ * @param string $text
+ * @return array
+ */
+function nsr_get_pdf_text_candidates($text) {
+    $text = (string) $text;
+    $candidates = array($text);
+
+    $decoded_obfuscated = nsr_decode_obfuscated_pdf_text($text);
+    if ($decoded_obfuscated !== '' && $decoded_obfuscated !== $text) {
+        $candidates[] = $decoded_obfuscated;
+    }
+
+    $upper_original = strtoupper(remove_accents($decoded_obfuscated !== '' ? $decoded_obfuscated : $text));
+
+    $compacted = nsr_compact_spaced_char_tokens($upper_original);
+    if ($compacted !== '' && $compacted !== $upper_original) {
+        $candidates[] = $compacted;
+    }
+
+    $alnum_spaced = trim((string) preg_replace('/\s+/', ' ', (string) preg_replace('/[^A-Z0-9]+/', ' ', $upper_original)));
+    $alnum_compacted = nsr_compact_spaced_char_tokens($alnum_spaced);
+    if ($alnum_compacted !== '' && $alnum_compacted !== $upper_original) {
+        $candidates[] = $alnum_compacted;
+    }
+
+    $ocr_decoded = nsr_decode_noisy_ocr_text($upper_original);
+    if ($ocr_decoded !== '' && $ocr_decoded !== $upper_original) {
+        $candidates[] = $ocr_decoded;
+
+        $ocr_compacted = nsr_compact_spaced_char_tokens($ocr_decoded);
+        if ($ocr_compacted !== '' && $ocr_compacted !== $ocr_decoded) {
+            $candidates[] = $ocr_compacted;
+        }
+
+        $ocr_alnum = trim((string) preg_replace('/\s+/', ' ', (string) preg_replace('/[^A-Z0-9]+/', ' ', $ocr_decoded)));
+        if ($ocr_alnum !== '' && $ocr_alnum !== $ocr_decoded) {
+            $candidates[] = $ocr_alnum;
+        }
+    }
+
+    $upper = strtoupper(remove_accents($text));
+    $encoded_keywords = array('SURGXWR', 'TXDQWLGDGH', 'FRGLJR', 'GHVFULFDR', 'SHGLGR', 'QRWD', 'ILVFDO');
+    $plain_keywords = array('PRODUTO', 'QUANTIDADE', 'CODIGO', 'DESCRICAO', 'PEDIDO', 'NOTA', 'FISCAL');
+
+    $encoded_score = 0;
+    foreach ($encoded_keywords as $kw) {
+        if (strpos($upper, $kw) !== false) {
+            $encoded_score++;
+        }
+    }
+
+    $plain_score = 0;
+    foreach ($plain_keywords as $kw) {
+        if (strpos($upper, $kw) !== false) {
+            $plain_score++;
+        }
+    }
+
+    // Alguns PDFs retornam texto com cifragem de deslocamento (+3). Nesse caso,
+    // tentamos uma versao com shift -3 para recuperar cabecalhos e itens.
+    if ($encoded_score > $plain_score) {
+        $decoded = nsr_shift_alpha_text($text, -3);
+        if ($decoded !== '' && $decoded !== $text) {
+            array_unshift($candidates, $decoded);
+
+            $decoded_compacted = nsr_compact_spaced_char_tokens(strtoupper(remove_accents($decoded)));
+            if ($decoded_compacted !== '' && $decoded_compacted !== strtoupper(remove_accents($decoded))) {
+                array_unshift($candidates, $decoded_compacted);
+            }
+
+            $decoded_ocr = nsr_decode_noisy_ocr_text($decoded);
+            if ($decoded_ocr !== '' && $decoded_ocr !== strtoupper(remove_accents($decoded))) {
+                array_unshift($candidates, $decoded_ocr);
+            }
+
+            $decoded_alnum = trim((string) preg_replace('/\s+/', ' ', (string) preg_replace('/[^A-Z0-9]+/', ' ', strtoupper(remove_accents($decoded)))));
+            $decoded_alnum_compacted = nsr_compact_spaced_char_tokens($decoded_alnum);
+            if ($decoded_alnum_compacted !== '' && $decoded_alnum_compacted !== strtoupper(remove_accents($decoded))) {
+                array_unshift($candidates, $decoded_alnum_compacted);
+            }
+        }
+    }
+
+    return array_values(array_unique($candidates));
+}
+
+/**
+ * Extrai itens PRD de texto ruidoso (caracteres quebrados/simbolos entre letras).
+ *
+ * @param string $text
+ * @return array
+ */
+function nsr_extract_prd_items_from_noisy_text($text) {
+    $items = array();
+    $normalized = strtoupper(remove_accents((string) $text));
+    $normalized = str_replace(array("\r", "\n", "\t"), ' ', $normalized);
+
+    // Aceita apenas PRD literal com separadores ruidosos entre caracteres.
+    if (!preg_match_all('/P\W*R\W*D\W*((?:\d\W*){5})/u', $normalized, $sku_matches, PREG_OFFSET_CAPTURE)) {
+        return $items;
+    }
+
+    foreach ($sku_matches[1] as $sku_match) {
+        $digits_raw = isset($sku_match[0]) ? (string) $sku_match[0] : '';
+        $digits = preg_replace('/\D+/', '', $digits_raw);
+        if ($digits === '' || strlen($digits) !== 5) {
+            continue;
+        }
+
+        $sku = 'PRD' . $digits;
+        if (!nsr_is_probable_sku($sku)) {
+            continue;
+        }
+
+        $offset = isset($sku_match[1]) ? (int) $sku_match[1] : 0;
+        $window = substr($normalized, $offset, 240);
+        $qty = 0;
+
+        if (preg_match('/\b(?:UNIDADE|UNID|UND|UN)\b/u', (string) $window) !== 1) {
+            continue;
+        }
+
+        if (preg_match('/\b(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{1,6})\s*(?:UNIDADE|UNID|UND|UN)\b/u', (string) $window, $qm_unit)) {
+            $qty = nsr_parse_quantity_value($qm_unit[1]);
+        }
+
+        if ($qty <= 0 && preg_match_all('/\b\d{1,14}(?:[\.,]\d{2})?\b/u', (string) $window, $num_matches)) {
+            foreach ($num_matches[0] as $num_token) {
+                $digits_only = preg_replace('/\D+/', '', (string) $num_token);
+                if (strlen($digits_only) >= 8 && strpos((string) $num_token, ',') === false && strpos((string) $num_token, '.') === false) {
+                    // Provavel GTIN/chave numerica longa, nao quantidade.
+                    continue;
+                }
+
+                $candidate_qty = nsr_parse_quantity_value($num_token);
+                if ($candidate_qty > 0 && $candidate_qty <= 50000) {
+                    $qty = $candidate_qty;
+                    break;
+                }
+            }
+        }
+
+        if ($qty <= 0) {
+            continue;
+        }
+
+        if (!isset($items[$sku])) {
+            $items[$sku] = array(
+                'sku'        => $sku,
+                'descricao'  => '',
+                'quantidade' => 0,
+                'valor'      => '',
+                'scanned'    => array(),
+            );
+        }
+
+        $items[$sku]['quantidade'] += $qty;
+    }
+
+    return $items;
+}
+
+/**
+ * Extrai itens do layout KeepData quando o PDF retorna texto muito ruidoso.
+ *
+ * Estrategia:
+ * - decodifica substituicoes comuns (3->P, 7->T, etc)
+ * - foca no bloco entre "CODIGO" e "NUMERO DE ITENS"
+ * - busca pares [codigo] + [quantidade] associados a "UN"
+ *
+ * @param string $text
+ * @return array
+ */
+function nsr_extract_keepdata_items_from_noisy_text($text) {
+    $items = array();
+
+    $decoded = nsr_decode_obfuscated_pdf_text($text);
+    $decoded = nsr_decode_noisy_ocr_text($decoded);
+    $normalized = strtoupper(remove_accents((string) $decoded));
+    $normalized = preg_replace('/[^A-Z0-9\s\.,]/', ' ', (string) $normalized);
+    $normalized = preg_replace('/\s+/', ' ', (string) $normalized);
+    $normalized = trim((string) $normalized);
+
+    if ($normalized === '') {
+        return $items;
+    }
+
+    if (strpos($normalized, 'CODIGO') === false || strpos($normalized, 'QTD') === false || strpos($normalized, 'UN') === false) {
+        return $items;
+    }
+
+    $start_pos = strpos($normalized, 'CODIGO');
+    if ($start_pos !== false) {
+        $normalized = substr($normalized, $start_pos);
+    }
+
+    $end_pos = strpos($normalized, 'NUMERO DE ITENS');
+    if ($end_pos !== false) {
+        $normalized = substr($normalized, 0, $end_pos);
+    }
+
+    if ($normalized === '') {
+        return $items;
+    }
+
+    // Insere separadores para facilitar split de blocos de item.
+    $normalized = preg_replace('/\b(PRD\d{1,5}|\d{3,5})\b\s+(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s+UN\b/', ' ||ITEM|| $1 $2 UN ', (string) $normalized);
+    $chunks = array_filter(array_map('trim', explode('||ITEM||', $normalized)));
+
+    foreach ($chunks as $chunk) {
+        if (!preg_match('/\b(PRD\d{1,5}|\d{3,5})\b/', $chunk, $m_code)) {
+            continue;
+        }
+
+        $code_raw = strtoupper((string) $m_code[1]);
+        if (strpos($code_raw, 'PRD') === 0) {
+            $digits = preg_replace('/\D+/', '', substr($code_raw, 3));
+        } else {
+            $digits = preg_replace('/\D+/', '', $code_raw);
+        }
+
+        if ($digits === '') {
+            continue;
+        }
+
+        // KeepData trabalha com SKU PRD + 5 digitos.
+        $digits = str_pad(substr($digits, -5), 5, '0', STR_PAD_LEFT);
+        $sku = 'PRD' . $digits;
+        if (!nsr_is_probable_sku($sku)) {
+            continue;
+        }
+
+        $qty = 0;
+        if (preg_match('/\b(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s+UN\b/', $chunk, $m_qty)) {
+            $qty = nsr_parse_quantity_value($m_qty[1]);
+        }
+
+        if ($qty <= 0) {
+            continue;
+        }
+
+        if (!isset($items[$sku])) {
+            $items[$sku] = array(
+                'sku'        => $sku,
+                'descricao'  => '',
+                'quantidade' => 0,
+                'valor'      => '',
+                'scanned'    => array(),
+            );
+        }
+
+        $items[$sku]['quantidade'] += $qty;
+    }
+
+    return $items;
+}
+
+/**
  * Extrai itens no formato do pedido KDT (SKU/GTIN + Qtd + Un).
  *
  * @param string $text
@@ -1502,11 +2123,15 @@ function nsr_extract_kdt_items_from_pdf_text($text) {
     $items = array();
 
     $normalized = strtoupper(remove_accents((string) $text));
+    $normalized = nsr_compact_spaced_char_tokens($normalized);
     $normalized = preg_replace('/\s+/', ' ', $normalized);
 
-    // Captura sequencias como: PRD00040 7898722600065 988,00 UN 210,00 207.480,00
-    // Grupos: (1) SKU  (2) Qtd  (3) Preco unitario (opcional)
-    $pattern = '/\b([A-Z]{2,}[A-Z0-9._\/-]{2,})\b\s+(?:\d{8,14}\s+)?(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{1,6})\s+UN\b(?:\s+(\d{1,3}(?:\.\d{3})*(?:,\d{2})?))?/u';
+    // Captura sequencias como:
+    // PRD00040 7898722600065 988,00 UN 210,00 ...
+    // PRD00040 988,00 PC 210,00 ...
+    // PRD00040 988,00 210,00 ...
+    // Grupos: (1) SKU PRD+numeros  (2) Qtd  (3) Preco unitario (opcional)
+    $pattern = '/\b(PRD\d{5})\b\s+(?:\d{8,14}\s+)?(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{1,6})(?:\s+(?:UN(?:ID(?:AD(?:E)?)?)?|UND|PC|PCT))?\b(?:\s+(\d{1,3}(?:\.\d{3})*(?:,\d{2})?))?/u';
     if (preg_match_all($pattern, $normalized, $matches, PREG_SET_ORDER)) {
         foreach ($matches as $m) {
             $sku = strtoupper((string) $m[1]);
@@ -1534,6 +2159,76 @@ function nsr_extract_kdt_items_from_pdf_text($text) {
         }
     }
 
+    // Fallback quando a linha nao vem no formato completo com "UN":
+    // captura PRD e tenta encontrar a quantidade mais proxima no trecho seguinte.
+    if (empty($items) && preg_match_all('/\b(PRD\d{5})\b/u', $normalized, $sku_matches, PREG_OFFSET_CAPTURE)) {
+        foreach ($sku_matches[1] as $sku_match) {
+            $sku = strtoupper((string) $sku_match[0]);
+            $offset = isset($sku_match[1]) ? (int) $sku_match[1] : 0;
+            if (!nsr_is_probable_sku($sku)) {
+                continue;
+            }
+
+            $window = substr($normalized, $offset + strlen($sku), 200);
+            $qty = 0;
+
+            if (preg_match('/\b(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{1,6})\s*(?:UNIDADE|UNID|UND|UN)\b/u', (string) $window, $qm_unit)) {
+                $qty = nsr_parse_quantity_value($qm_unit[1]);
+            }
+
+            if ($qty <= 0 && preg_match_all('/\b(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d{1,6})\b/u', (string) $window, $qm_all)) {
+                foreach ($qm_all[1] as $qv) {
+                    $candidate_qty = nsr_parse_quantity_value($qv);
+                    if ($candidate_qty > 0 && $candidate_qty <= 50000) {
+                        $qty = $candidate_qty;
+                        break;
+                    }
+                }
+            }
+
+            if ($qty <= 0) {
+                continue;
+            }
+
+            if (!isset($items[$sku])) {
+                $items[$sku] = array(
+                    'sku'       => $sku,
+                    'descricao' => '',
+                    'quantidade'=> 0,
+                    'valor'     => '',
+                    'scanned'   => array(),
+                );
+            }
+
+            $items[$sku]['quantidade'] += $qty;
+        }
+    }
+
+    if (empty($items)) {
+        $items = nsr_extract_prd_items_from_noisy_text($normalized);
+    }
+
+    if (empty($items)) {
+        $items = nsr_extract_keepdata_items_from_noisy_text($normalized);
+    }
+
+    // Ultimo recurso: extrai SKUs diretamente do binario do PDF.
+    // Usado quando o pdftotext embaralha o texto por causa de layout colunar no Linux.
+    if (empty($items) && !empty($GLOBALS['nsr_current_pdf_path'])) {
+        $binary_items = nsr_extract_skus_from_pdf_binary((string) $GLOBALS['nsr_current_pdf_path']);
+        if (!empty($binary_items)) {
+            $items = $binary_items;
+        }
+    }
+
+    // Filtro final defensivo: garante apenas SKU valido e quantidade plausivel.
+    foreach (array_keys($items) as $sku_key) {
+        $qty_value = isset($items[$sku_key]['quantidade']) ? (int) $items[$sku_key]['quantidade'] : 0;
+        if (!nsr_is_probable_sku((string) $sku_key) || $qty_value <= 0 || $qty_value > 50000) {
+            unset($items[$sku_key]);
+        }
+    }
+
     return $items;
 }
 
@@ -1543,7 +2238,7 @@ function nsr_extract_kdt_items_from_pdf_text($text) {
  * @param string $text
  * @return array
  */
-function nsr_extract_order_from_pdf_text($text) {
+function nsr_extract_order_from_pdf_text_single($text) {
     $raw_lines = preg_split('/\r\n|\r|\n/', (string) $text);
     $lines = array();
 
@@ -1603,6 +2298,9 @@ function nsr_extract_order_from_pdf_text($text) {
 
         if (preg_match('/\b(?:SKU|CODIGO(?:\s+DO\s+PRODUTO)?|COD\.)\b\s*[:\-]?\s*([A-Z0-9._\/-]{3,})/', $norm, $m)) {
             $sku = strtoupper($m[1]);
+            if (!nsr_is_probable_sku($sku)) {
+                $sku = '';
+            }
         }
 
         if (preg_match('/\b(?:QTD|QUANTIDADE)\b\s*[:x\-]?\s*([0-9\.,]{1,20})\b/', $norm, $m)) {
@@ -1624,7 +2322,7 @@ function nsr_extract_order_from_pdf_text($text) {
             $qty = nsr_parse_quantity_value($m[1]);
         }
 
-        if ($sku === '' || $qty <= 0) {
+        if ($sku === '' || !nsr_is_probable_sku($sku) || $qty <= 0) {
             continue;
         }
 
@@ -1645,6 +2343,39 @@ function nsr_extract_order_from_pdf_text($text) {
         'nota_fiscal' => $nota_fiscal,
         'data_venda'  => $data_venda,
         'itens'       => $items,
+    );
+}
+
+/**
+ * Extrai pedido, nota fiscal e itens (SKU + quantidade) do texto de PDF.
+ *
+ * @param string $text
+ * @return array
+ */
+function nsr_extract_order_from_pdf_text($text) {
+    $candidates = nsr_get_pdf_text_candidates($text);
+    $best = null;
+
+    foreach ($candidates as $candidate_text) {
+        $parsed = nsr_extract_order_from_pdf_text_single($candidate_text);
+        if (!empty($parsed['itens'])) {
+            return $parsed;
+        }
+
+        if ($best === null) {
+            $best = $parsed;
+        }
+    }
+
+    if ($best !== null) {
+        return $best;
+    }
+
+    return array(
+        'pedido'      => '',
+        'nota_fiscal' => '',
+        'data_venda'  => '',
+        'itens'       => array(),
     );
 }
 
@@ -1767,7 +2498,17 @@ function nsr_cleanup_old_scan_sessions() {
  * @return array
  */
 function nsr_recompute_scan_session_flags($session) {
-    $skus = array_keys(isset($session['itens']) ? $session['itens'] : array());
+    $itens = isset($session['itens']) && is_array($session['itens']) ? $session['itens'] : array();
+
+    // Defesa final: nunca manter SKU fora do padrao PRD+numeros na sessao.
+    foreach (array_keys($itens) as $sku_key) {
+        if (!nsr_is_probable_sku((string) $sku_key)) {
+            unset($itens[$sku_key]);
+        }
+    }
+
+    $session['itens'] = $itens;
+    $skus = array_keys($itens);
     $products_map = nsr_get_products_by_skus($skus);
 
     $missing_skus = array();
@@ -2248,10 +2989,204 @@ function nsr_handle_products_import_submission() {
 }
 
 /**
+ * Processa cadastro manual de produto (SKU x descricao).
+ *
+ * @return array
+ */
+function nsr_handle_product_manual_submission() {
+    global $wpdb;
+
+    $messages = array(
+        'success' => array(),
+        'error' => array(),
+    );
+
+    if (!isset($_POST['nsr_product_manual_submit'])) {
+        return $messages;
+    }
+
+    if (!current_user_can('manage_options')) {
+        $messages['error'][] = 'Permissao insuficiente para cadastrar produto.';
+        return $messages;
+    }
+
+    check_admin_referer('nsr_product_manual', 'nsr_product_manual_nonce');
+
+    $sku = strtoupper(sanitize_text_field(wp_unslash($_POST['nsr_product_sku'] ?? '')));
+    $descricao = sanitize_text_field(wp_unslash($_POST['nsr_product_descricao'] ?? ''));
+
+    if ($sku === '') {
+        $messages['error'][] = 'Informe o SKU para cadastrar.';
+        return $messages;
+    }
+
+    if (!nsr_is_valid_prd_sku($sku)) {
+        $messages['error'][] = 'SKU invalido. Use o padrao PRD + numeros (ex.: PRD00069).';
+        return $messages;
+    }
+
+    $products_table = nsr_get_products_table_name();
+    $sql = $wpdb->prepare(
+        "INSERT INTO {$products_table} (sku, descricao, created_at, updated_at)
+         VALUES (%s, %s, NOW(), NOW())
+         ON DUPLICATE KEY UPDATE
+            descricao = VALUES(descricao),
+            updated_at = NOW()",
+        $sku,
+        $descricao
+    );
+
+    $affected = $wpdb->query($sql);
+    if ($affected === false) {
+        $messages['error'][] = 'Nao foi possivel salvar o produto informado.';
+        return $messages;
+    }
+
+    $messages['success'][] = sprintf('Produto %s salvo com sucesso.', $sku);
+    return $messages;
+}
+
+/**
  * Processa upload de PDF e fluxo de bipagem de NS.
  *
  * @return array
  */
+/**
+ * Extrai pedido, nota fiscal e itens (SKU + quantidade) de um XML de NF-e 4.0.
+ *
+ * @param string $file_path Caminho absoluto para o arquivo XML.
+ * @return array|WP_Error
+ */
+function nsr_parse_xml_nfe($file_path) {
+    $xml_content = @file_get_contents($file_path);
+    if ($xml_content === false || trim($xml_content) === '') {
+        return new WP_Error('nsr_xml_read_error', 'Nao foi possivel ler o arquivo XML enviado.');
+    }
+
+    libxml_use_internal_errors(true);
+    $xml = simplexml_load_string($xml_content, 'SimpleXMLElement', LIBXML_NOCDATA);
+    libxml_clear_errors();
+
+    if ($xml === false) {
+        return new WP_Error('nsr_xml_parse_error', 'Arquivo XML invalido ou corrompido.');
+    }
+
+    $ns = 'http://www.portalfiscal.inf.br/nfe';
+
+    // Suporta <nfeProc><NFe> e <NFe> direto
+    $nfe_node = null;
+    $local_name = $xml->getName();
+    if ($local_name === 'nfeProc') {
+        $children = $xml->children($ns);
+        $nfe_node = isset($children->NFe) ? $children->NFe : null;
+        if ($nfe_node === null) {
+            // tenta sem namespace
+            $nfe_node = isset($xml->NFe) ? $xml->NFe : null;
+        }
+    } else {
+        $nfe_node = $xml;
+    }
+
+    if ($nfe_node === null) {
+        return new WP_Error('nsr_xml_structure_error', 'Estrutura do XML nao reconhecida como NF-e valida.');
+    }
+
+    $infNFe = $nfe_node->children($ns)->infNFe;
+    if ($infNFe === null || !isset($infNFe->ide)) {
+        // fallback sem namespace
+        $infNFe = isset($nfe_node->infNFe) ? $nfe_node->infNFe : null;
+    }
+    if ($infNFe === null) {
+        return new WP_Error('nsr_xml_structure_error', 'Elemento infNFe nao encontrado no XML.');
+    }
+
+    // IDE — numero da NF e data
+    $ide = $infNFe->children($ns)->ide;
+    if ($ide === null) {
+        $ide = isset($infNFe->ide) ? $infNFe->ide : null;
+    }
+
+    $nota_fiscal = $ide !== null && isset($ide->nNF) ? trim((string) $ide->nNF) : '';
+    $data_venda  = '';
+    if ($ide !== null && isset($ide->dhEmi)) {
+        $dt = date_create(trim((string) $ide->dhEmi));
+        if ($dt !== false) {
+            $data_venda = date_format($dt, 'd/m/Y');
+        }
+    }
+
+    // Itens (det)
+    $det_list = $infNFe->children($ns)->det;
+    if ($det_list === null || count($det_list) === 0) {
+        $det_list = isset($infNFe->det) ? $infNFe->det : null;
+    }
+    if ($det_list === null || count($det_list) === 0) {
+        return new WP_Error('nsr_xml_no_items', 'Nenhum item (det) encontrado no XML da NF-e.');
+    }
+
+    $pedido = '';
+    $itens  = array();
+
+    foreach ($det_list as $det) {
+        $prod = $det->children($ns)->prod;
+        if ($prod === null || count($prod) === 0) {
+            $prod = isset($det->prod) ? $det->prod : null;
+        }
+        if ($prod === null) {
+            continue;
+        }
+
+        $sku       = strtoupper(trim((string) $prod->cProd));
+        $qty_raw   = trim((string) $prod->qCom);
+        $descricao = trim((string) $prod->xProd);
+        $valor_str = trim((string) $prod->vUnCom);
+
+        if ($pedido === '' && isset($prod->xPed) && trim((string) $prod->xPed) !== '') {
+            $pedido = trim((string) $prod->xPed);
+        }
+
+        // XML pode vir com cProd sem o padrao interno PRD000XX.
+        // Quando isso acontecer, tenta extrair SKU valido da descricao do item.
+        if (!nsr_is_valid_prd_sku($sku)) {
+            $desc_upper = strtoupper(remove_accents($descricao));
+            if (preg_match('/\b(PRD\d{5})\b/', $desc_upper, $m_sku_desc)) {
+                $sku = strtoupper((string) $m_sku_desc[1]);
+            }
+        }
+
+        if (!nsr_is_valid_prd_sku($sku)) {
+            continue;
+        }
+
+        $qty = (int) floatval(str_replace(',', '.', $qty_raw));
+        if ($qty <= 0) {
+            continue;
+        }
+
+        if (!isset($itens[$sku])) {
+            $itens[$sku] = array(
+                'sku'        => $sku,
+                'descricao'  => $descricao,
+                'quantidade' => 0,
+                'valor'      => $valor_str,
+                'scanned'    => array(),
+            );
+        }
+        $itens[$sku]['quantidade'] += $qty;
+    }
+
+    if (empty($itens)) {
+        return new WP_Error('nsr_xml_no_skus', 'Nenhum SKU/quantidade encontrado no XML da NF-e.');
+    }
+
+    return array(
+        'pedido'      => $pedido,
+        'nota_fiscal' => $nota_fiscal,
+        'data_venda'  => $data_venda,
+        'itens'       => $itens,
+    );
+}
+
 function nsr_handle_pdf_scan_workflow_submission() {
     $messages = array(
         'success' => array(),
@@ -2285,16 +3220,50 @@ function nsr_handle_pdf_scan_workflow_submission() {
                     $messages['error'][] = 'Arquivo PDF invalido.';
                 } elseif ($error_code !== UPLOAD_ERR_OK) {
                     $messages['error'][] = sprintf('Falha no upload do PDF (%d).', $error_code);
-                } elseif (strtolower(pathinfo($safe_name, PATHINFO_EXTENSION)) !== 'pdf') {
-                    $messages['error'][] = 'Formato nao suportado. Envie um arquivo .pdf.';
+                } elseif (!in_array(strtolower(pathinfo($safe_name, PATHINFO_EXTENSION)), array('pdf', 'xml'), true)) {
+                    $messages['error'][] = 'Formato nao suportado. Envie um arquivo .pdf ou .xml (NF-e).';
+                } elseif (strtolower(pathinfo($safe_name, PATHINFO_EXTENSION)) === 'xml') {
+                    // --- Processamento de XML NF-e ---
+                    $parsed_xml = nsr_parse_xml_nfe($tmp_name);
+                    if (is_wp_error($parsed_xml)) {
+                        $messages['error'][] = $parsed_xml->get_error_message();
+                    } elseif (empty($parsed_xml['itens'])) {
+                        $messages['error'][] = 'Nenhum item encontrado no XML da NF-e.';
+                    } else {
+                        $token = nsr_generate_scan_session_token();
+                        $session = array(
+                            'session_token'  => $token,
+                            'pedido'         => (string) $parsed_xml['pedido'],
+                            'nota_fiscal'    => (string) $parsed_xml['nota_fiscal'],
+                            'data_venda'     => isset($parsed_xml['data_venda']) ? (string) $parsed_xml['data_venda'] : '',
+                            'origem_arquivo' => $safe_name,
+                            'itens'          => $parsed_xml['itens'],
+                            'missing_skus'   => array(),
+                        );
+                        $session = nsr_recompute_scan_session_flags($session);
+                        if (!nsr_save_scan_session($token, $session)) {
+                            $messages['error'][] = 'Nao foi possivel salvar a sessao de bipagem.';
+                        } else {
+                            $active_token = $token;
+                            $messages['success'][] = sprintf(
+                                'XML %s lido com sucesso. %d SKU(s) encontrado(s). Inicie a bipagem dos NS.',
+                                esc_html($safe_name),
+                                count($parsed_xml['itens'])
+                            );
+                        }
+                    }
                 } else {
+                    // --- Processamento de PDF ---
+                    $GLOBALS['nsr_current_pdf_path'] = $tmp_name;
                     $text = nsr_read_pdf_text($tmp_name);
                     if (is_wp_error($text)) {
                         $messages['error'][] = $text->get_error_message();
                     } else {
                         $parsed = nsr_extract_order_from_pdf_text($text);
                         if (empty($parsed['itens'])) {
-                            $sample = esc_html(substr($text, 0, 400));
+                            $candidates = nsr_get_pdf_text_candidates($text);
+                            $best_sample_text = !empty($candidates) ? (string) $candidates[0] : (string) $text;
+                            $sample = esc_html(substr($best_sample_text, 0, 400));
                             $messages['error'][] = 'Nao foi possivel detectar SKU e quantidade no PDF. Texto extraido (amostra): ' . $sample;
                         } else {
                             $token = nsr_generate_scan_session_token();
@@ -2307,9 +3276,7 @@ function nsr_handle_pdf_scan_workflow_submission() {
                                 'itens'          => $parsed['itens'],
                                 'missing_skus'   => array(),
                             );
-
                             $session = nsr_recompute_scan_session_flags($session);
-
                             if (!nsr_save_scan_session($token, $session)) {
                                 $messages['error'][] = 'Nao foi possivel salvar a sessao de bipagem.';
                             } else {
@@ -2344,7 +3311,7 @@ function nsr_handle_pdf_scan_workflow_submission() {
                 $parts = preg_split('/[;|,\t]/', $line, 2);
                 $sku_raw = isset($parts[0]) ? strtoupper(trim($parts[0])) : '';
                 $qty_raw = isset($parts[1]) ? trim($parts[1]) : '1';
-                if ($sku_raw === '' || !preg_match('/^[A-Z0-9._\/ -]+$/', $sku_raw)) {
+                if ($sku_raw === '' || !nsr_is_valid_prd_sku($sku_raw)) {
                     continue;
                 }
                 $qty = nsr_parse_quantity_value($qty_raw);
@@ -2472,7 +3439,7 @@ function nsr_handle_pdf_scan_workflow_submission() {
             }
 
             if (!empty($session['missing_skus'])) {
-                $messages['error'][] = 'Existem SKUs do pedido sem cadastro de produto.';
+                $messages['success'][] = 'Aviso: existem SKUs sem cadastro de produto, mas a finalizacao sera permitida.';
             }
 
             $has_qty_error = false;
@@ -2537,6 +3504,18 @@ function nsr_handle_pdf_scan_workflow_submission() {
                     $messages['error'][] = 'Falha ao salvar NS no banco. Nenhum dado foi confirmado.';
                 } else {
                     $wpdb->query('COMMIT');
+
+                    $tiny_result = nsr_send_serials_to_tiny_order($session);
+                    if (is_wp_error($tiny_result)) {
+                        $messages['success'][] = 'Aviso Tiny: ' . $tiny_result->get_error_message();
+                    } elseif (is_array($tiny_result) && isset($tiny_result['ok']) && $tiny_result['ok']) {
+                        $messages['success'][] = sprintf(
+                            'Tiny atualizado com sucesso no pedido %s (%d NS enviado(s)).',
+                            isset($tiny_result['order_id']) ? (string) $tiny_result['order_id'] : '-',
+                            isset($tiny_result['serials_count']) ? (int) $tiny_result['serials_count'] : 0
+                        );
+                    }
+
                     nsr_delete_scan_session($active_token);
                     $session = null;
                     $active_token = '';
@@ -2720,6 +3699,351 @@ function nsr_ajax_scan_ns() {
 }
 add_action('wp_ajax_nsr_scan_ns', 'nsr_ajax_scan_ns');
 
+/**
+ * Separa NS em prefixo + sufixo numerico para geracao sequencial.
+ *
+ * @param string $ns
+ * @return array|null
+ */
+function nsr_split_ns_sequence_parts($ns) {
+    $ns = trim((string) $ns);
+    if ($ns === '') {
+        return null;
+    }
+
+    if (!preg_match('/^(.*?)(\d+)$/', $ns, $m)) {
+        return null;
+    }
+
+    return array(
+        'prefix' => (string) $m[1],
+        'number' => (int) $m[2],
+        'width' => strlen((string) $m[2]),
+    );
+}
+
+/**
+ * Monta NS sequencial com o mesmo padding do sufixo numerico.
+ *
+ * @param string $prefix
+ * @param int    $number
+ * @param int    $width
+ * @return string
+ */
+function nsr_build_sequential_ns($prefix, $number, $width) {
+    return (string) $prefix . str_pad((string) $number, (int) $width, '0', STR_PAD_LEFT);
+}
+
+/**
+ * Informa se a integracao Tiny esta habilitada por constante.
+ *
+ * Configure no wp-config.php:
+ * define('NSR_TINY_TOKEN', 'seu_token_tiny');
+ *
+ * @return bool
+ */
+function nsr_is_tiny_integration_enabled() {
+    return defined('NSR_TINY_TOKEN') && trim((string) NSR_TINY_TOKEN) !== '';
+}
+
+/**
+ * Retorna id do pedido alvo para envio ao Tiny.
+ *
+ * @param array $session
+ * @return string
+ */
+function nsr_get_tiny_order_id_from_session($session) {
+    $prefer = defined('NSR_TINY_ORDER_ID_SOURCE') ? strtolower(trim((string) NSR_TINY_ORDER_ID_SOURCE)) : 'pedido';
+    $pedido = isset($session['pedido']) ? trim((string) $session['pedido']) : '';
+    $nf = isset($session['nota_fiscal']) ? trim((string) $session['nota_fiscal']) : '';
+
+    if ($prefer === 'nota_fiscal') {
+        return $nf !== '' ? $nf : $pedido;
+    }
+
+    return $pedido !== '' ? $pedido : $nf;
+}
+
+/**
+ * Coleta NS bipados por SKU da sessao atual.
+ *
+ * @param array $session
+ * @return array
+ */
+function nsr_collect_serials_by_sku($session) {
+    $result = array();
+    $itens = isset($session['itens']) && is_array($session['itens']) ? $session['itens'] : array();
+
+    foreach ($itens as $sku => $item) {
+        if (!nsr_is_probable_sku((string) $sku)) {
+            continue;
+        }
+
+        $scanned = isset($item['scanned']) && is_array($item['scanned']) ? $item['scanned'] : array();
+        if (empty($scanned)) {
+            continue;
+        }
+
+        $seen = array();
+        $values = array();
+        foreach ($scanned as $ns) {
+            $ns = trim((string) $ns);
+            if ($ns === '') {
+                continue;
+            }
+
+            $norm = nsr_normalize_lookup_value($ns);
+            if ($norm === '' || isset($seen[$norm])) {
+                continue;
+            }
+
+            $seen[$norm] = true;
+            $values[] = $ns;
+        }
+
+        if (!empty($values)) {
+            $result[$sku] = $values;
+        }
+    }
+
+    return $result;
+}
+
+/**
+ * Monta texto de observacao para o Tiny com os NS bipados.
+ *
+ * @param array $session
+ * @param array $serials_by_sku
+ * @return string
+ */
+function nsr_build_tiny_obs_text($session, $serials_by_sku) {
+    $lines = array();
+    $pedido = isset($session['pedido']) ? trim((string) $session['pedido']) : '';
+    $nf = isset($session['nota_fiscal']) ? trim((string) $session['nota_fiscal']) : '';
+
+    $lines[] = 'NS bipados via NS Rastreio';
+    $lines[] = 'Pedido: ' . ($pedido !== '' ? $pedido : '-');
+    $lines[] = 'NF: ' . ($nf !== '' ? $nf : '-');
+
+    foreach ($serials_by_sku as $sku => $serials) {
+        $lines[] = $sku . ': ' . implode(', ', $serials);
+    }
+
+    $text = implode("\n", $lines);
+    $max_len = defined('NSR_TINY_OBS_MAX_LEN') ? max(300, (int) NSR_TINY_OBS_MAX_LEN) : 1800;
+
+    if (strlen($text) > $max_len) {
+        $text = substr($text, 0, $max_len - 15) . '...(truncado)';
+    }
+
+    return $text;
+}
+
+/**
+ * Envia observacao com NS bipados para o Tiny (pedido.alterar API 2.0).
+ *
+ * @param array $session
+ * @return array|WP_Error
+ */
+function nsr_send_serials_to_tiny_order($session) {
+    if (!nsr_is_tiny_integration_enabled()) {
+        return array(
+            'skipped' => true,
+            'message' => 'Integracao Tiny nao configurada.',
+        );
+    }
+
+    $order_id = nsr_get_tiny_order_id_from_session($session);
+    if ($order_id === '') {
+        return new WP_Error('nsr_tiny_missing_order', 'Pedido/NF nao informado para envio ao Tiny.');
+    }
+
+    $serials_by_sku = nsr_collect_serials_by_sku($session);
+    if (empty($serials_by_sku)) {
+        return new WP_Error('nsr_tiny_empty_serials', 'Nao ha NS bipados para enviar ao Tiny.');
+    }
+
+    $obs_text = nsr_build_tiny_obs_text($session, $serials_by_sku);
+    $dados_pedido = array(
+        'obs_interna' => $obs_text,
+    );
+
+    if (defined('NSR_TINY_WRITE_OBS_PUBLIC') && NSR_TINY_WRITE_OBS_PUBLIC) {
+        $dados_pedido['obs'] = $obs_text;
+    }
+
+    $payload = array(
+        'dados_pedido' => $dados_pedido,
+    );
+
+    $endpoint = defined('NSR_TINY_PEDIDO_ALTERAR_URL') && trim((string) NSR_TINY_PEDIDO_ALTERAR_URL) !== ''
+        ? (string) NSR_TINY_PEDIDO_ALTERAR_URL
+        : 'https://api.tiny.com.br/api2/pedido.alterar.php';
+
+    $response = wp_remote_post($endpoint, array(
+        'timeout' => 25,
+        'body' => array(
+            'token' => (string) NSR_TINY_TOKEN,
+            'id' => $order_id,
+            'dados_pedido' => wp_json_encode($payload),
+            'formato' => 'json',
+        ),
+    ));
+
+    if (is_wp_error($response)) {
+        return new WP_Error('nsr_tiny_http_error', 'Erro de comunicacao com Tiny: ' . $response->get_error_message());
+    }
+
+    $body = wp_remote_retrieve_body($response);
+    $data = json_decode((string) $body, true);
+    if (!is_array($data) || !isset($data['retorno'])) {
+        return new WP_Error('nsr_tiny_invalid_response', 'Retorno inesperado do Tiny ao atualizar pedido.');
+    }
+
+    $retorno = $data['retorno'];
+    $status = isset($retorno['status']) ? strtoupper(trim((string) $retorno['status'])) : '';
+    if ($status !== 'OK') {
+        $erro_msg = 'Falha ao atualizar observacao no Tiny.';
+        if (isset($retorno['erros'][0]['erro']) && trim((string) $retorno['erros'][0]['erro']) !== '') {
+            $erro_msg = trim((string) $retorno['erros'][0]['erro']);
+        }
+        return new WP_Error('nsr_tiny_api_error', $erro_msg);
+    }
+
+    return array(
+        'ok' => true,
+        'order_id' => $order_id,
+        'serials_count' => array_sum(array_map('count', $serials_by_sku)),
+    );
+}
+
+/**
+ * AJAX: Gerar NS sequenciais a partir de um NS inicial para o SKU ativo.
+ */
+function nsr_ajax_generate_ns_sequence() {
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(array('msg' => 'Permissao insuficiente.'), 403);
+    }
+
+    check_ajax_referer('nsr_ajax_scan', 'nonce');
+
+    $token = sanitize_text_field(wp_unslash(isset($_POST['token']) ? $_POST['token'] : ''));
+    $sku = strtoupper(sanitize_text_field(wp_unslash(isset($_POST['sku']) ? $_POST['sku'] : '')));
+    $ns_start = sanitize_text_field(wp_unslash(isset($_POST['ns_start']) ? $_POST['ns_start'] : ''));
+    $qty_requested = absint(wp_unslash(isset($_POST['qty']) ? $_POST['qty'] : 0));
+
+    $session = nsr_get_scan_session($token);
+    if (empty($session)) {
+        wp_send_json_error(array('msg' => 'Sessao nao encontrada ou expirada.'), 404);
+    }
+
+    if ($sku === '' || $ns_start === '' || $qty_requested <= 0) {
+        wp_send_json_error(array('msg' => 'Informe SKU, NS inicial e quantidade valida.'), 400);
+    }
+
+    if (!isset($session['itens'][$sku])) {
+        wp_send_json_error(array('msg' => 'SKU ' . $sku . ' nao faz parte do pedido.'), 400);
+    }
+
+    $sequence = nsr_split_ns_sequence_parts($ns_start);
+    if (empty($sequence)) {
+        wp_send_json_error(array('msg' => 'NS inicial deve terminar com numero para gerar sequencia.'), 400);
+    }
+
+    $expected = (int) $session['itens'][$sku]['quantidade'];
+    $already = isset($session['itens'][$sku]['scanned']) ? count($session['itens'][$sku]['scanned']) : 0;
+    $available = max(0, $expected - $already);
+    if ($available <= 0) {
+        wp_send_json_error(array('msg' => sprintf('SKU %s ja atingiu a quantidade esperada (%d).', $sku, $expected)), 409);
+    }
+
+    $qty_target = min($qty_requested, $available);
+    if (!isset($session['itens'][$sku]['scanned']) || !is_array($session['itens'][$sku]['scanned'])) {
+        $session['itens'][$sku]['scanned'] = array();
+    }
+
+    $existing_normalized = array();
+    foreach ($session['itens'] as $item) {
+        $scanned = isset($item['scanned']) && is_array($item['scanned']) ? $item['scanned'] : array();
+        foreach ($scanned as $s) {
+            $norm = nsr_normalize_lookup_value($s);
+            if ($norm !== '') {
+                $existing_normalized[$norm] = true;
+            }
+        }
+    }
+
+    $generated = 0;
+    $skipped_duplicates = 0;
+    $preview_added = array();
+    $current_number = (int) $sequence['number'];
+    $max_attempts = max($qty_target * 5, 200);
+    $attempts = 0;
+
+    while ($generated < $qty_target && $attempts < $max_attempts) {
+        $attempts++;
+        $candidate = nsr_build_sequential_ns($sequence['prefix'], $current_number, $sequence['width']);
+        $current_number++;
+
+        $norm_candidate = nsr_normalize_lookup_value($candidate);
+        if ($norm_candidate === '') {
+            continue;
+        }
+
+        if (isset($existing_normalized[$norm_candidate])) {
+            $skipped_duplicates++;
+            continue;
+        }
+
+        $session['itens'][$sku]['scanned'][] = $candidate;
+        $existing_normalized[$norm_candidate] = true;
+        $generated++;
+
+        if (count($preview_added) < 5) {
+            $preview_added[] = $candidate;
+        }
+    }
+
+    if ($generated <= 0) {
+        wp_send_json_error(array('msg' => 'Nenhum NS novo foi gerado (duplicidade ou limite atingido).'), 409);
+    }
+
+    // Persiste pedido/NF se vieram junto.
+    $pedido = sanitize_text_field(wp_unslash(isset($_POST['pedido']) ? $_POST['pedido'] : ''));
+    $nf = sanitize_text_field(wp_unslash(isset($_POST['nota_fiscal']) ? $_POST['nota_fiscal'] : ''));
+    if ($pedido !== '') {
+        $session['pedido'] = $pedido;
+    }
+    if ($nf !== '') {
+        $session['nota_fiscal'] = $nf;
+    }
+
+    nsr_save_scan_session($token, $session);
+
+    $scanned_list = $session['itens'][$sku]['scanned'];
+    $scanned_count = count($scanned_list);
+
+    $msg = sprintf('Gerados %d NS sequenciais para %s.', $generated, $sku);
+    if ($qty_requested > $qty_target) {
+        $msg .= sprintf(' Ajustado para o saldo disponivel (%d).', $qty_target);
+    }
+    if ($skipped_duplicates > 0) {
+        $msg .= sprintf(' Duplicados ignorados: %d.', $skipped_duplicates);
+    }
+
+    wp_send_json_success(array(
+        'sku' => $sku,
+        'scanned_count' => $scanned_count,
+        'expected' => $expected,
+        'is_ok' => ($scanned_count === $expected),
+        'scanned_list' => $scanned_list,
+        'generated' => $generated,
+        'preview_added' => $preview_added,
+        'msg' => $msg,
+    ));
+}
+add_action('wp_ajax_nsr_generate_ns_sequence', 'nsr_ajax_generate_ns_sequence');
+
 // AJAX: Remover NS
 function nsr_ajax_remove_ns() {
     if (!current_user_can('manage_options')) {
@@ -2795,9 +4119,7 @@ function nsr_ajax_finalize_session() {
     }
 
     $session = nsr_recompute_scan_session_flags($session);
-    if (!empty($session['missing_skus'])) {
-        wp_send_json_error(array('msg' => 'SKU(s) sem cadastro: ' . implode(', ', $session['missing_skus'])), 400);
-    }
+    $missing_skus = !empty($session['missing_skus']) && is_array($session['missing_skus']) ? $session['missing_skus'] : array();
 
     foreach ($session['itens'] as $sku => $item) {
         $expected = (int) $item['quantidade'];
@@ -2855,11 +4177,30 @@ function nsr_ajax_finalize_session() {
     }
 
     $wpdb->query('COMMIT');
+
+    $tiny_result = nsr_send_serials_to_tiny_order($session);
+
     nsr_delete_scan_session($token);
 
+    $msg = sprintf('%d NS salvos com sucesso. Pedido: %s | NF: %s', $saved, $session['pedido'], $session['nota_fiscal']);
+    if (!empty($missing_skus)) {
+        $msg .= ' | Aviso: SKU(s) sem cadastro: ' . implode(', ', $missing_skus);
+    }
+
+    if (is_wp_error($tiny_result)) {
+        $msg .= ' | Aviso Tiny: ' . $tiny_result->get_error_message();
+    } elseif (is_array($tiny_result) && isset($tiny_result['ok']) && $tiny_result['ok']) {
+        $msg .= sprintf(
+            ' | Tiny atualizado no pedido %s (%d NS).',
+            isset($tiny_result['order_id']) ? (string) $tiny_result['order_id'] : '-',
+            isset($tiny_result['serials_count']) ? (int) $tiny_result['serials_count'] : 0
+        );
+    }
+
     wp_send_json_success(array(
-        'msg'   => sprintf('%d NS salvos com sucesso. Pedido: %s | NF: %s', $saved, $session['pedido'], $session['nota_fiscal']),
+        'msg'   => $msg,
         'saved' => $saved,
+        'missing_skus' => $missing_skus,
     ));
 }
 add_action('wp_ajax_nsr_finalize_session', 'nsr_ajax_finalize_session');
@@ -2885,6 +4226,7 @@ function nsr_render_admin_page() {
     );
     $messages = nsr_merge_messages($messages, nsr_handle_import_submission());
     $messages = nsr_merge_messages($messages, nsr_handle_products_import_submission());
+    $messages = nsr_merge_messages($messages, nsr_handle_product_manual_submission());
     $pdf_workflow = nsr_handle_pdf_scan_workflow_submission();
     $messages = nsr_merge_messages($messages, $pdf_workflow['messages']);
     $scan_session = isset($pdf_workflow['session']) && is_array($pdf_workflow['session']) ? $pdf_workflow['session'] : null;
@@ -2951,13 +4293,29 @@ function nsr_render_admin_page() {
             </p>
         </form>
 
+        <h3>2.1) Cadastro manual rapido de produto</h3>
+        <p>Use este formulario quando chegar SKU novo no pedido (ex.: PRD000XX) e ele ainda nao estiver na base.</p>
+        <form method="post" style="margin-bottom:24px;display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;">
+            <?php wp_nonce_field('nsr_product_manual', 'nsr_product_manual_nonce'); ?>
+            <label style="display:flex;flex-direction:column;gap:4px;">
+                SKU
+                <input type="text" name="nsr_product_sku" placeholder="Ex: PRD00016" required style="min-width:180px;" />
+            </label>
+            <label style="display:flex;flex-direction:column;gap:4px;flex:1;min-width:260px;">
+                Descricao
+                <input type="text" name="nsr_product_descricao" placeholder="Descricao do produto" />
+            </label>
+            <button type="submit" name="nsr_product_manual_submit" class="button button-primary">Salvar produto</button>
+        </form>
+
         <h2>3) Leitura de Pedido de Venda (PDF) e Bipagem de NS</h2>
         <p>Envie o PDF do pedido para extrair SKU e quantidade. Depois, realize a bipagem dos NS por SKU.</p>
         <form method="post" enctype="multipart/form-data" style="margin-bottom:16px;">
             <?php wp_nonce_field('nsr_pdf_upload', 'nsr_pdf_nonce'); ?>
-            <input type="file" name="nsr_pdf_file" accept=".pdf" required />
-            <button type="submit" name="nsr_pdf_upload_submit" class="button">Ler PDF</button>
+            <input type="file" name="nsr_pdf_file" accept=".pdf,.xml" required />
+            <button type="submit" name="nsr_pdf_upload_submit" class="button">Ler PDF / XML</button>
         </form>
+        <p style="margin-top:-10px;color:#666;font-size:12px;">Aceita PDF do pedido de venda ou XML da NF-e (NF-e 4.0).</p>
 
         <details style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;" open>
             <summary style="cursor:pointer;font-weight:600;">Inserir itens manualmente (use quando o PDF e imagem/scan)</summary>
@@ -3081,7 +4439,22 @@ function nsr_render_admin_page() {
                         <button type="button" class="button button-primary" onclick="nsrScanNs()" style="height:36px;align-self:flex-end;">
                             Bipar NS
                         </button>
+                        <label style="display:flex;flex-direction:column;gap:3px;font-size:13px;min-width:150px;">
+                            Qtd sequencial
+                            <input type="number" id="nsr-inp-seq-qty" min="1" step="1" value="" placeholder="Ex: 80" style="width:120px;" />
+                        </label>
+                        <label style="display:flex;align-items:center;gap:6px;font-size:12px;padding-bottom:8px;">
+                            <input type="checkbox" id="nsr-inp-seq-auto" />
+                            Completar saldo restante automaticamente
+                        </label>
+                        <button type="button" class="button" onclick="nsrGenerateSequentialNs()" style="height:36px;align-self:flex-end;">
+                            Gerar sequencial
+                        </button>
                     </div>
+
+                    <p style="margin:0 0 8px 0;color:#555;font-size:12px;">
+                        Dica: informe o primeiro NS em <strong>Numero de Serie (NS)</strong>, defina a <strong>Qtd sequencial</strong> e clique em <strong>Gerar sequencial</strong>.
+                    </p>
 
                     <div id="nsr-scan-feedback" style="min-height:28px;font-weight:600;padding:4px 8px;border-radius:4px;display:none;"></div>
                 </div>
@@ -3225,6 +4598,70 @@ function nsr_render_admin_page() {
                             } else {
                                 showFeedback(res.data.msg, 'error');
                                 document.getElementById('nsr-inp-ns').select();
+                            }
+                        })
+                        .catch(function(){ showFeedback('Erro de comunicacao com o servidor.', 'error'); });
+                };
+
+                // ----- Gerar sequencia de NS -----
+                window.nsrGenerateSequentialNs = function() {
+                    var nsStart = document.getElementById('nsr-inp-ns').value.trim();
+                    var autoQty = document.getElementById('nsr-inp-seq-auto').checked;
+                    var qtyRaw  = document.getElementById('nsr-inp-seq-qty').value;
+                    var qty     = parseInt(qtyRaw, 10);
+
+                    if (!activeSku) {
+                        showFeedback('Selecione um SKU primeiro.', 'error');
+                        return;
+                    }
+                    if (!nsStart) {
+                        showFeedback('Informe o NS inicial no campo de bipagem.', 'error');
+                        document.getElementById('nsr-inp-ns').focus();
+                        return;
+                    }
+
+                    if (autoQty) {
+                        var activeRow = document.querySelector('#nsr-sku-table tbody tr[data-sku="' + activeSku + '"]');
+                        if (activeRow) {
+                            var expected = parseInt(activeRow.dataset.expected, 10) || 0;
+                            var scanned  = parseInt(activeRow.querySelector('.nsr-count').textContent, 10) || 0;
+                            qty = Math.max(0, expected - scanned);
+                            document.getElementById('nsr-inp-seq-qty').value = qty > 0 ? String(qty) : '';
+                        }
+                    }
+
+                    if (!qty || qty <= 0) {
+                        showFeedback(autoQty ? 'Este SKU nao possui saldo restante para gerar.' : 'Informe uma quantidade sequencial valida.', 'error');
+                        if (!autoQty) {
+                            document.getElementById('nsr-inp-seq-qty').focus();
+                        }
+                        return;
+                    }
+
+                    var pedido = document.getElementById('nsr-inp-pedido').value.trim();
+                    var nf     = document.getElementById('nsr-inp-nf').value.trim();
+                    var fd = new FormData();
+                    fd.append('action',      'nsr_generate_ns_sequence');
+                    fd.append('nonce',       NONCE);
+                    fd.append('token',       TOKEN);
+                    fd.append('sku',         activeSku);
+                    fd.append('ns_start',    nsStart);
+                    fd.append('qty',         String(qty));
+                    fd.append('pedido',      pedido);
+                    fd.append('nota_fiscal', nf);
+
+                    fetch(AJAXURL, {method:'POST', body:fd})
+                        .then(function(r){ return r.json(); })
+                        .then(function(res){
+                            if (res.success) {
+                                updateRow(res.data);
+                                showFeedback(res.data.msg, 'ok');
+                                document.getElementById('nsr-hdr-pedido').textContent = pedido;
+                                document.getElementById('nsr-hdr-nf').textContent     = nf;
+                                document.getElementById('nsr-inp-ns').focus();
+                                document.getElementById('nsr-inp-ns').select();
+                            } else {
+                                showFeedback(res.data.msg, 'error');
                             }
                         })
                         .catch(function(){ showFeedback('Erro de comunicacao com o servidor.', 'error'); });
