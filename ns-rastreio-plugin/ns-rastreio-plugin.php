@@ -5233,6 +5233,9 @@ function nsr_render_admin_page() {
                     <button type="button" class="button" id="nsr-btn-send-tiny-tech" onclick="nsrSendTiny('tech')">
                         Enviar NS ao Tiny TECH
                     </button>
+                    <button type="button" class="button" id="nsr-btn-copy-serials" onclick="nsrCopyScannedNs()">
+                        Copiar NS bipados
+                    </button>
                     <button type="button" class="button button-primary" id="nsr-btn-finalize" onclick="nsrFinalize()">
                         Finalizar e salvar NS
                     </button>
@@ -5304,6 +5307,66 @@ function nsr_render_admin_page() {
                         el._t = setTimeout(function(){ el.style.display='none'; }, 2500);
                     }
                 }
+
+                function nsrCollectAllScannedNs() {
+                    var values = [];
+                    var seen = {};
+                    document.querySelectorAll('#nsr-sku-table .nsr-remove-ns').forEach(function(btn){
+                        var ns = (btn.dataset.ns || '').trim();
+                        if (!ns) return;
+                        var key = ns.toUpperCase();
+                        if (seen[key]) return;
+                        seen[key] = true;
+                        values.push(ns);
+                    });
+                    return values;
+                }
+
+                function nsrCopyText(text) {
+                    if (navigator.clipboard && window.isSecureContext) {
+                        return navigator.clipboard.writeText(text);
+                    }
+
+                    return new Promise(function(resolve, reject){
+                        try {
+                            var ta = document.createElement('textarea');
+                            ta.value = text;
+                            ta.style.position = 'fixed';
+                            ta.style.left = '-9999px';
+                            ta.style.top = '0';
+                            document.body.appendChild(ta);
+                            ta.focus();
+                            ta.select();
+                            var ok = document.execCommand('copy');
+                            document.body.removeChild(ta);
+                            if (ok) {
+                                resolve();
+                            } else {
+                                reject(new Error('copy_failed'));
+                            }
+                        } catch (e) {
+                            reject(e);
+                        }
+                    });
+                }
+
+                window.nsrCopyScannedNs = function() {
+                    var serials = nsrCollectAllScannedNs();
+                    if (!serials.length) {
+                        showFeedback('Nao ha NS bipados para copiar.', 'error');
+                        return;
+                    }
+
+                    var text = serials.join('\n');
+                    nsrCopyText(text)
+                        .then(function(){
+                            showFeedback(serials.length + ' NS copiado(s). Cole nas observacoes do pedido no Tiny.', 'ok');
+                        })
+                        .catch(function(){
+                            window.prompt('Nao foi possivel copiar automaticamente. Copie manualmente os NS abaixo:', text);
+                            showFeedback('Copia manual exibida. Use Ctrl+C.', 'warn');
+                        });
+                };
 
                 function updateRow(data) {
                     var row = document.querySelector('#nsr-sku-table tbody tr[data-sku="'+data.sku+'"]');
