@@ -3047,6 +3047,45 @@ function nsr_handle_product_manual_submission() {
 }
 
 /**
+ * Processa salvamento de tokens Tiny por sistema (KDT, TEKE, TECH).
+ *
+ * @return array
+ */
+function nsr_handle_tiny_tokens_submission() {
+    $messages = array(
+        'success' => array(),
+        'error' => array(),
+    );
+
+    if (!isset($_POST['nsr_tiny_tokens_submit'])) {
+        return $messages;
+    }
+
+    if (!current_user_can('manage_options')) {
+        $messages['error'][] = 'Permissao insuficiente para salvar tokens Tiny.';
+        return $messages;
+    }
+
+    check_admin_referer('nsr_tiny_tokens', 'nsr_tiny_tokens_nonce');
+
+    $systems = nsr_get_tiny_system_labels();
+    $posted_tokens = isset($_POST['nsr_tiny_tokens']) && is_array($_POST['nsr_tiny_tokens'])
+        ? wp_unslash($_POST['nsr_tiny_tokens'])
+        : array();
+
+    $tokens_to_save = array();
+    foreach ($systems as $system_key => $label) {
+        $raw = isset($posted_tokens[$system_key]) ? (string) $posted_tokens[$system_key] : '';
+        $tokens_to_save[$system_key] = sanitize_text_field($raw);
+    }
+
+    update_option('nsr_tiny_tokens', $tokens_to_save);
+    $messages['success'][] = 'Tokens Tiny salvos com sucesso para KDT, TEKE e TECH.';
+
+    return $messages;
+}
+
+/**
  * Processa upload de PDF e fluxo de bipagem de NS.
  *
  * @return array
@@ -3505,17 +3544,6 @@ function nsr_handle_pdf_scan_workflow_submission() {
                 } else {
                     $wpdb->query('COMMIT');
 
-                    $tiny_result = nsr_send_serials_to_tiny_order($session);
-                    if (is_wp_error($tiny_result)) {
-                        $messages['success'][] = 'Aviso Tiny: ' . $tiny_result->get_error_message();
-                    } elseif (is_array($tiny_result) && isset($tiny_result['ok']) && $tiny_result['ok']) {
-                        $messages['success'][] = sprintf(
-                            'Tiny atualizado com sucesso no pedido %s (%d NS enviado(s)).',
-                            isset($tiny_result['order_id']) ? (string) $tiny_result['order_id'] : '-',
-                            isset($tiny_result['serials_count']) ? (int) $tiny_result['serials_count'] : 0
-                        );
-                    }
-
                     nsr_delete_scan_session($active_token);
                     $session = null;
                     $active_token = '';
@@ -3735,15 +3763,73 @@ function nsr_build_sequential_ns($prefix, $number, $width) {
 }
 
 /**
- * Informa se a integracao Tiny esta habilitada por constante.
+ * Lista os sistemas Tiny suportados no plugin.
  *
- * Configure no wp-config.php:
- * define('NSR_TINY_TOKEN', 'seu_token_tiny');
+ * @return array
+ */
+function nsr_get_tiny_system_labels() {
+    return array(
+        'kdt' => 'KDT',
+        'teke' => 'TEKE',
+        'tech' => 'TECH',
+    );
+}
+
+/**
+ * Retorna os tokens Tiny configurados no admin (com fallback para constantes).
  *
+ * @return array
+ */
+function nsr_get_tiny_tokens_settings() {
+    $systems = nsr_get_tiny_system_labels();
+    $saved = get_option('nsr_tiny_tokens', array());
+    if (!is_array($saved)) {
+        $saved = array();
+    }
+
+    $tokens = array();
+    foreach ($systems as $system_key => $label) {
+        $token = isset($saved[$system_key]) ? trim((string) $saved[$system_key]) : '';
+        if ($token === '') {
+            $const_name = 'NSR_TINY_TOKEN_' . strtoupper($system_key);
+            if (defined($const_name) && trim((string) constant($const_name)) !== '') {
+                $token = trim((string) constant($const_name));
+            }
+        }
+        if ($token === '' && defined('NSR_TINY_TOKEN') && trim((string) NSR_TINY_TOKEN) !== '') {
+            $token = trim((string) NSR_TINY_TOKEN);
+        }
+        $tokens[$system_key] = $token;
+    }
+
+    return $tokens;
+}
+
+/**
+ * Retorna token do Tiny para um sistema especifico.
+ *
+ * @param string $system_key
+ * @return string
+ */
+function nsr_get_tiny_token_by_system($system_key) {
+    $system_key = strtolower(trim((string) $system_key));
+    $systems = nsr_get_tiny_system_labels();
+    if (!isset($systems[$system_key])) {
+        return '';
+    }
+
+    $tokens = nsr_get_tiny_tokens_settings();
+    return isset($tokens[$system_key]) ? trim((string) $tokens[$system_key]) : '';
+}
+
+/**
+ * Informa se a integracao Tiny esta habilitada para um sistema.
+ *
+ * @param string $system_key
  * @return bool
  */
-function nsr_is_tiny_integration_enabled() {
-    return defined('NSR_TINY_TOKEN') && trim((string) NSR_TINY_TOKEN) !== '';
+function nsr_is_tiny_integration_enabled($system_key) {
+    return nsr_get_tiny_token_by_system($system_key) !== '';
 }
 
 /**
@@ -3842,15 +3928,19 @@ function nsr_build_tiny_obs_text($session, $serials_by_sku) {
 /**
  * Envia observacao com NS bipados para o Tiny (pedido.alterar API 2.0).
  *
- * @param array $session
+ * @param array  $session
+ * @param string $system_key
  * @return array|WP_Error
  */
-function nsr_send_serials_to_tiny_order($session) {
-    if (!nsr_is_tiny_integration_enabled()) {
-        return array(
-            'skipped' => true,
-            'message' => 'Integracao Tiny nao configurada.',
-        );
+function nsr_send_serials_to_tiny_order($session, $system_key) {
+    $system_key = strtolower(trim((string) $system_key));
+    $systems = nsr_get_tiny_system_labels();
+    if (!isset($systems[$system_key])) {
+        return new WP_Error('nsr_tiny_invalid_system', 'Sistema Tiny invalido para envio.');
+    }
+
+    if (!nsr_is_tiny_integration_enabled($system_key)) {
+        return new WP_Error('nsr_tiny_missing_token', 'Token Tiny nao configurado para o sistema ' . $systems[$system_key] . '.');
     }
 
     $order_id = nsr_get_tiny_order_id_from_session($session);
@@ -3883,7 +3973,7 @@ function nsr_send_serials_to_tiny_order($session) {
     $response = wp_remote_post($endpoint, array(
         'timeout' => 25,
         'body' => array(
-            'token' => (string) NSR_TINY_TOKEN,
+            'token' => nsr_get_tiny_token_by_system($system_key),
             'id' => $order_id,
             'dados_pedido' => wp_json_encode($payload),
             'formato' => 'json',
@@ -3912,6 +4002,8 @@ function nsr_send_serials_to_tiny_order($session) {
 
     return array(
         'ok' => true,
+        'system' => $system_key,
+        'system_label' => $systems[$system_key],
         'order_id' => $order_id,
         'serials_count' => array_sum(array_map('count', $serials_by_sku)),
     );
@@ -4177,24 +4269,11 @@ function nsr_ajax_finalize_session() {
     }
 
     $wpdb->query('COMMIT');
-
-    $tiny_result = nsr_send_serials_to_tiny_order($session);
-
     nsr_delete_scan_session($token);
 
     $msg = sprintf('%d NS salvos com sucesso. Pedido: %s | NF: %s', $saved, $session['pedido'], $session['nota_fiscal']);
     if (!empty($missing_skus)) {
         $msg .= ' | Aviso: SKU(s) sem cadastro: ' . implode(', ', $missing_skus);
-    }
-
-    if (is_wp_error($tiny_result)) {
-        $msg .= ' | Aviso Tiny: ' . $tiny_result->get_error_message();
-    } elseif (is_array($tiny_result) && isset($tiny_result['ok']) && $tiny_result['ok']) {
-        $msg .= sprintf(
-            ' | Tiny atualizado no pedido %s (%d NS).',
-            isset($tiny_result['order_id']) ? (string) $tiny_result['order_id'] : '-',
-            isset($tiny_result['serials_count']) ? (int) $tiny_result['serials_count'] : 0
-        );
     }
 
     wp_send_json_success(array(
@@ -4204,6 +4283,54 @@ function nsr_ajax_finalize_session() {
     ));
 }
 add_action('wp_ajax_nsr_finalize_session', 'nsr_ajax_finalize_session');
+
+// AJAX: Enviar NS ao Tiny manualmente
+function nsr_ajax_send_tiny_serials() {
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(array('msg' => 'Permissao insuficiente.'), 403);
+    }
+
+    check_ajax_referer('nsr_ajax_scan', 'nonce');
+
+    $token = sanitize_text_field(wp_unslash(isset($_POST['token']) ? $_POST['token'] : ''));
+    $tiny_system = sanitize_key(wp_unslash(isset($_POST['tiny_system']) ? $_POST['tiny_system'] : ''));
+    $tiny_systems = nsr_get_tiny_system_labels();
+    if (!isset($tiny_systems[$tiny_system])) {
+        wp_send_json_error(array('msg' => 'Sistema Tiny invalido. Use KDT, TEKE ou TECH.'), 400);
+    }
+
+    $session = nsr_get_scan_session($token);
+    if (empty($session)) {
+        wp_send_json_error(array('msg' => 'Sessao nao encontrada ou expirada.'), 404);
+    }
+
+    $pedido = sanitize_text_field(wp_unslash(isset($_POST['pedido']) ? $_POST['pedido'] : ''));
+    $nf = sanitize_text_field(wp_unslash(isset($_POST['nota_fiscal']) ? $_POST['nota_fiscal'] : ''));
+    if ($pedido !== '') {
+        $session['pedido'] = $pedido;
+    }
+    if ($nf !== '') {
+        $session['nota_fiscal'] = $nf;
+    }
+
+    $session = nsr_recompute_scan_session_flags($session);
+    nsr_save_scan_session($token, $session);
+
+    $tiny_result = nsr_send_serials_to_tiny_order($session, $tiny_system);
+    if (is_wp_error($tiny_result)) {
+        wp_send_json_error(array('msg' => 'Aviso Tiny: ' . $tiny_result->get_error_message()), 400);
+    }
+
+    $msg = sprintf(
+        'Tiny %s atualizado com sucesso no pedido %s (%d NS enviado(s)).',
+        isset($tiny_result['system_label']) ? (string) $tiny_result['system_label'] : strtoupper($tiny_system),
+        isset($tiny_result['order_id']) ? (string) $tiny_result['order_id'] : '-',
+        isset($tiny_result['serials_count']) ? (int) $tiny_result['serials_count'] : 0
+    );
+
+    wp_send_json_success(array('msg' => $msg));
+}
+add_action('wp_ajax_nsr_send_tiny_serials', 'nsr_ajax_send_tiny_serials');
 
 // AJAX: Cancelar sessao
 function nsr_ajax_cancel_session() {
@@ -4227,9 +4354,12 @@ function nsr_render_admin_page() {
     $messages = nsr_merge_messages($messages, nsr_handle_import_submission());
     $messages = nsr_merge_messages($messages, nsr_handle_products_import_submission());
     $messages = nsr_merge_messages($messages, nsr_handle_product_manual_submission());
+    $messages = nsr_merge_messages($messages, nsr_handle_tiny_tokens_submission());
     $pdf_workflow = nsr_handle_pdf_scan_workflow_submission();
     $messages = nsr_merge_messages($messages, $pdf_workflow['messages']);
     $scan_session = isset($pdf_workflow['session']) && is_array($pdf_workflow['session']) ? $pdf_workflow['session'] : null;
+    $tiny_systems = nsr_get_tiny_system_labels();
+    $tiny_tokens = nsr_get_tiny_tokens_settings();
 
     foreach ($messages['success'] as $message) {
         add_settings_error('nsr_messages', 'nsr_success_' . wp_rand(), $message, 'updated');
@@ -4306,6 +4436,27 @@ function nsr_render_admin_page() {
                 <input type="text" name="nsr_product_descricao" placeholder="Descricao do produto" />
             </label>
             <button type="submit" name="nsr_product_manual_submit" class="button button-primary">Salvar produto</button>
+        </form>
+
+        <h3>2.2) Integracao Tiny (tokens por sistema)</h3>
+        <p>Configure um token para cada sistema Tiny: KDT, TEKE e TECH. O envio de NS sera feito manualmente e separado por sistema.</p>
+        <form method="post" style="margin-bottom:24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;max-width:820px;">
+            <?php wp_nonce_field('nsr_tiny_tokens', 'nsr_tiny_tokens_nonce'); ?>
+            <?php foreach ($tiny_systems as $system_key => $system_label) : ?>
+                <label style="display:flex;flex-direction:column;gap:4px;">
+                    Token Tiny <?php echo esc_html($system_label); ?>
+                    <input
+                        type="text"
+                        name="nsr_tiny_tokens[<?php echo esc_attr($system_key); ?>]"
+                        value="<?php echo esc_attr(isset($tiny_tokens[$system_key]) ? $tiny_tokens[$system_key] : ''); ?>"
+                        placeholder="Cole o token do sistema <?php echo esc_attr($system_label); ?>"
+                        autocomplete="off"
+                    />
+                </label>
+            <?php endforeach; ?>
+            <div style="grid-column:1/-1;">
+                <button type="submit" name="nsr_tiny_tokens_submit" class="button button-secondary">Salvar tokens Tiny</button>
+            </div>
         </form>
 
         <h2>3) Leitura de Pedido de Venda (PDF) e Bipagem de NS</h2>
@@ -4461,6 +4612,15 @@ function nsr_render_admin_page() {
 
                 <!-- Botoes finalizar/cancelar -->
                 <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                    <button type="button" class="button" id="nsr-btn-send-tiny-kdt" onclick="nsrSendTiny('kdt')">
+                        Enviar NS ao Tiny KDT
+                    </button>
+                    <button type="button" class="button" id="nsr-btn-send-tiny-teke" onclick="nsrSendTiny('teke')">
+                        Enviar NS ao Tiny TEKE
+                    </button>
+                    <button type="button" class="button" id="nsr-btn-send-tiny-tech" onclick="nsrSendTiny('tech')">
+                        Enviar NS ao Tiny TECH
+                    </button>
                     <button type="button" class="button button-primary" id="nsr-btn-finalize" onclick="nsrFinalize()">
                         Finalizar e salvar NS
                     </button>
@@ -4795,6 +4955,42 @@ function nsr_render_admin_page() {
                                 showFeedback(res.data.msg, 'error');
                             }
                         });
+                };
+
+                // ----- Enviar Tiny (manual) -----
+                window.nsrSendTiny = function(tinySystem) {
+                    var pedido = document.getElementById('nsr-inp-pedido').value.trim();
+                    var nf     = document.getElementById('nsr-inp-nf').value.trim();
+                    var systemLabels = {kdt:'KDT', teke:'TEKE', tech:'TECH'};
+                    var systemLabel = systemLabels[tinySystem] || '';
+                    if (!systemLabel) {
+                        showFeedback('Sistema Tiny invalido.', 'error');
+                        return;
+                    }
+                    if (!pedido && !nf) {
+                        showFeedback('Informe Pedido ou Nota Fiscal antes de enviar ao Tiny ' + systemLabel + '.', 'error');
+                        return;
+                    }
+                    if (!confirm('Enviar NS bipados para observacoes do pedido no Tiny ' + systemLabel + ' agora?')) return;
+
+                    var fd = new FormData();
+                    fd.append('action',      'nsr_send_tiny_serials');
+                    fd.append('nonce',       NONCE);
+                    fd.append('token',       TOKEN);
+                    fd.append('pedido',      pedido);
+                    fd.append('nota_fiscal', nf);
+                    fd.append('tiny_system', tinySystem);
+
+                    fetch(AJAXURL, {method:'POST', body:fd})
+                        .then(function(r){ return r.json(); })
+                        .then(function(res){
+                            if (res.success) {
+                                showFeedback(res.data.msg, 'ok');
+                            } else {
+                                showFeedback(res.data.msg, 'error');
+                            }
+                        })
+                        .catch(function(){ showFeedback('Erro de comunicacao com o Tiny.', 'error'); });
                 };
 
                 // ----- Cancelar -----

@@ -215,14 +215,23 @@ Exemplo de retorno OK:
 }
 ```
 
-### Envio automatico apos finalizar bipagem (NS -> observacoes do pedido)
+### Envio manual para Tiny (NS -> observacoes do pedido)
 
-O plugin pode enviar automaticamente os numeros de serie bipados para o Tiny ao concluir a acao de finalizar e salvar NS.
+O plugin envia os numeros de serie para o Tiny somente quando voce clicar nos botoes manuais de envio na tela de bipagem:
 
-Configure no `wp-config.php`:
+- `Enviar NS ao Tiny KDT`
+- `Enviar NS ao Tiny TEKE`
+- `Enviar NS ao Tiny TECH`
+
+Configure os tokens no painel admin do plugin, na secao `Integracao Tiny (tokens por sistema)`, preenchendo:
+
+- Token Tiny KDT
+- Token Tiny TEKE
+- Token Tiny TECH
+
+Configuracoes opcionais no `wp-config.php` continuam disponiveis:
 
 ```php
-define('NSR_TINY_TOKEN', 'SEU_TOKEN_TINY');
 // Opcional: usar NF como id do pedido no Tiny. Padrao: pedido.
 // define('NSR_TINY_ORDER_ID_SOURCE', 'nota_fiscal');
 // Opcional: tambem escrever no campo publico obs (alem de obs_interna).
@@ -233,8 +242,12 @@ define('NSR_TINY_TOKEN', 'SEU_TOKEN_TINY');
 // define('NSR_TINY_OBS_MAX_LEN', 1800);
 ```
 
-Com isso habilitado, ao finalizar a sessao de bipagem:
+Opcionalmente, tambem e possivel definir tokens por constante (`NSR_TINY_TOKEN_KDT`, `NSR_TINY_TOKEN_TEKE`, `NSR_TINY_TOKEN_TECH`) como fallback.
 
-- os NS sao salvos no banco do plugin;
-- o plugin chama `pedido.alterar.php` no Tiny;
+Com isso habilitado, ao clicar em um dos botoes de envio Tiny:
+
+- os NS bipados da sessao atual sao agrupados por SKU;
+- o plugin chama `pedido.alterar.php` no Tiny do sistema escolhido (KDT/TEKE/TECH);
 - os NS sao enviados para `dados_pedido.obs_interna` (e opcionalmente `obs`).
+
+Ao clicar em `Finalizar e salvar NS`, o plugin apenas salva no banco local (sem envio automatico ao Tiny).
