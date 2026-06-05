@@ -4186,11 +4186,17 @@ function nsr_tiny_merge_existing_observations($pedido, $new_internal_obs) {
     $current_public = isset($pedido['obs']) ? nsr_tiny_normalize_short_obs((string) $pedido['obs']) : '';
     $new_internal_obs = nsr_tiny_normalize_short_obs($new_internal_obs);
 
+    $already_in_internal = $current_internal !== '' && $new_internal_obs !== '' && stripos($current_internal, $new_internal_obs) !== false;
+    $would_overflow_internal = false;
+    if ($current_internal !== '' && $new_internal_obs !== '' && !$already_in_internal) {
+        $would_overflow_internal = mb_strlen($current_internal . "\n" . $new_internal_obs) > $max_len;
+    }
+
     $merged_internal = nsr_tiny_append_unique_limited($current_internal, $new_internal_obs, $max_len);
     $merged_public = $current_public;
     $moved_internal_to_public = false;
 
-    if ($current_internal !== '' && $merged_internal === mb_substr($new_internal_obs, 0, $max_len)) {
+    if ($would_overflow_internal) {
         $merged_public = nsr_tiny_append_unique_limited($current_public, $current_internal, $max_len);
         $moved_internal_to_public = $merged_public !== $current_public;
     }
