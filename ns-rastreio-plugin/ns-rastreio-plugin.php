@@ -4082,6 +4082,128 @@ function nsr_build_tiny_obs_text($session, $serials_by_sku) {
 }
 
 /**
+ * Busca dados atuais do pedido no Tiny para preservar observacoes existentes.
+ *
+ * @param string $token
+ * @param string $order_id
+ * @return array
+ */
+function nsr_tiny_get_order_details($token, $order_id) {
+    $token = trim((string) $token);
+    $order_id = trim((string) $order_id);
+    if ($token === '' || $order_id === '') {
+        return array();
+    }
+
+    $response = wp_remote_post('https://api.tiny.com.br/api2/pedido.obter.php', array(
+        'timeout' => 25,
+        'body' => array(
+            'token' => $token,
+            'id' => $order_id,
+            'formato' => 'json',
+        ),
+    ));
+
+    if (is_wp_error($response)) {
+        nsr_log_tiny_debug('Falha ao consultar pedido.obter para preservar observacoes.', array(
+            'order_id' => $order_id,
+            'error' => $response->get_error_message(),
+        ));
+        return array();
+    }
+
+    $body = wp_remote_retrieve_body($response);
+    $data = json_decode((string) $body, true);
+    if (!is_array($data) || !isset($data['retorno']) || !is_array($data['retorno'])) {
+        return array();
+    }
+
+    $retorno = $data['retorno'];
+    $status = isset($retorno['status']) ? strtoupper(trim((string) $retorno['status'])) : '';
+    if ($status !== 'OK' || !isset($retorno['pedido']) || !is_array($retorno['pedido'])) {
+        return array();
+    }
+
+    return $retorno['pedido'];
+}
+
+/**
+ * Normaliza texto de observacao para campos curtos do Tiny.
+ *
+ * @param string $text
+ * @return string
+ */
+function nsr_tiny_normalize_short_obs($text) {
+    $text = preg_replace("/\r\n|\r|\n/", "\n", (string) $text);
+    $text = preg_replace("/[ \t]+/", ' ', $text);
+    $text = preg_replace("/ *\n */", "\n", $text);
+    return trim((string) $text);
+}
+
+/**
+ * Acrescenta texto sem duplicar e respeitando limite de caracteres.
+ *
+ * @param string $base
+ * @param string $addition
+ * @param int    $max_len
+ * @return string
+ */
+function nsr_tiny_append_unique_limited($base, $addition, $max_len = 100) {
+    $base = nsr_tiny_normalize_short_obs($base);
+    $addition = nsr_tiny_normalize_short_obs($addition);
+    $max_len = max(1, (int) $max_len);
+
+    if ($addition === '') {
+        return mb_substr($base, 0, $max_len);
+    }
+
+    if ($base === '') {
+        return mb_substr($addition, 0, $max_len);
+    }
+
+    if (stripos($base, $addition) !== false) {
+        return mb_substr($base, 0, $max_len);
+    }
+
+    $combined = $base . "\n" . $addition;
+    if (mb_strlen($combined) <= $max_len) {
+        return $combined;
+    }
+
+    return mb_substr($addition, 0, $max_len);
+}
+
+/**
+ * Monta observacoes preservando conteudo ja existente no Tiny.
+ *
+ * @param array  $pedido
+ * @param string $new_internal_obs
+ * @return array
+ */
+function nsr_tiny_merge_existing_observations($pedido, $new_internal_obs) {
+    $max_len = 100;
+    $current_internal = isset($pedido['obs_interna']) ? nsr_tiny_normalize_short_obs((string) $pedido['obs_interna']) : '';
+    $current_public = isset($pedido['obs']) ? nsr_tiny_normalize_short_obs((string) $pedido['obs']) : '';
+    $new_internal_obs = nsr_tiny_normalize_short_obs($new_internal_obs);
+
+    $merged_internal = nsr_tiny_append_unique_limited($current_internal, $new_internal_obs, $max_len);
+    $merged_public = $current_public;
+    $moved_internal_to_public = false;
+
+    if ($current_internal !== '' && $merged_internal === mb_substr($new_internal_obs, 0, $max_len)) {
+        $merged_public = nsr_tiny_append_unique_limited($current_public, $current_internal, $max_len);
+        $moved_internal_to_public = $merged_public !== $current_public;
+    }
+
+    return array(
+        'obs_interna' => $merged_internal,
+        'obs' => $merged_public,
+        'had_internal_obs' => $current_internal !== '',
+        'moved_internal_to_public' => $moved_internal_to_public,
+    );
+}
+
+/**
  * Monta payload de dados_pedido alinhado ao layout oficial do Tiny.
  *
  * Alguns ambientes exigem estrutura mais estrita para validar o body.
@@ -4091,40 +4213,15 @@ function nsr_build_tiny_obs_text($session, $serials_by_sku) {
  * @param string $obs_text
  * @return array
  */
-function nsr_build_tiny_dados_pedido_strict_layout($token, $order_id, $obs_text) {
+function nsr_build_tiny_dados_pedido_strict_layout($token, $order_id, $obs_text, $pedido = null) {
     $payload = array(
         'obs_interna' => trim((string) $obs_text),
     );
 
     $token = trim((string) $token);
     $order_id = trim((string) $order_id);
-    $pedido = array();
-    if ($token !== '' && $order_id !== '') {
-        $response = wp_remote_post('https://api.tiny.com.br/api2/pedido.obter.php', array(
-            'timeout' => 25,
-            'body' => array(
-                'token' => $token,
-                'id' => $order_id,
-                'formato' => 'json',
-            ),
-        ));
-
-        if (is_wp_error($response)) {
-            nsr_log_tiny_debug('Falha ao consultar pedido.obter para capturar pagamentos_integrados.', array(
-                'order_id' => $order_id,
-                'error' => $response->get_error_message(),
-            ));
-        } else {
-            $body = wp_remote_retrieve_body($response);
-            $data = json_decode((string) $body, true);
-            if (is_array($data) && isset($data['retorno']) && is_array($data['retorno'])) {
-                $retorno = $data['retorno'];
-                $status = isset($retorno['status']) ? strtoupper(trim((string) $retorno['status'])) : '';
-                if ($status === 'OK' && isset($retorno['pedido']) && is_array($retorno['pedido'])) {
-                    $pedido = $retorno['pedido'];
-                }
-            }
-        }
+    if (!is_array($pedido)) {
+        $pedido = nsr_tiny_get_order_details($token, $order_id);
     }
 
     // Captura parcelas do pedido quando existirem, pois podem ser exigidas por validacao da conta.
@@ -4287,13 +4384,6 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
     $obs_text = nsr_build_tiny_obs_text($session, $serials_by_sku);
     $obs_text_single_line = str_replace(array("\r\n", "\r", "\n"), ' | ', $obs_text);
     $obs_text_single_line = mb_substr($obs_text_single_line, 0, 100);
-    $dados_pedido = array(
-        'obs_interna' => $obs_text_single_line,
-    );
-
-    if (defined('NSR_TINY_WRITE_OBS_PUBLIC') && NSR_TINY_WRITE_OBS_PUBLIC) {
-        $dados_pedido['obs'] = $obs_text;
-    }
 
     $endpoint = defined('NSR_TINY_PEDIDO_ALTERAR_URL') && trim((string) NSR_TINY_PEDIDO_ALTERAR_URL) !== ''
         ? (string) NSR_TINY_PEDIDO_ALTERAR_URL
@@ -4302,7 +4392,32 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
     $token_value = nsr_get_tiny_token_by_system($system_key);
     $order_id_original = $order_id;
     $order_id = nsr_resolve_tiny_internal_order_id($token_value, $order_id_original);
-    $dados_pedido_strict = nsr_build_tiny_dados_pedido_strict_layout($token_value, $order_id, $obs_text_single_line);
+    $tiny_order_details = nsr_tiny_get_order_details($token_value, $order_id);
+    $merged_obs = nsr_tiny_merge_existing_observations($tiny_order_details, $obs_text_single_line);
+    $dados_pedido = array(
+        'obs_interna' => $merged_obs['obs_interna'],
+    );
+
+    if (
+        $merged_obs['moved_internal_to_public'] ||
+        (defined('NSR_TINY_WRITE_OBS_PUBLIC') && NSR_TINY_WRITE_OBS_PUBLIC)
+    ) {
+        $dados_pedido['obs'] = $merged_obs['obs'];
+    }
+
+    if ($merged_obs['had_internal_obs']) {
+        nsr_log_tiny_debug('Observacao interna existente preservada no envio Tiny.', array(
+            'order_id' => $order_id,
+            'moved_internal_to_public' => $merged_obs['moved_internal_to_public'] ? 'yes' : 'no',
+            'obs_interna_len' => mb_strlen((string) $dados_pedido['obs_interna']),
+            'obs_len' => isset($dados_pedido['obs']) ? mb_strlen((string) $dados_pedido['obs']) : 0,
+        ));
+    }
+
+    $dados_pedido_strict = nsr_build_tiny_dados_pedido_strict_layout($token_value, $order_id, $dados_pedido['obs_interna'], $tiny_order_details);
+    if (isset($dados_pedido['obs'])) {
+        $dados_pedido_strict['obs'] = $dados_pedido['obs'];
+    }
     nsr_log_tiny_debug('Pedido alvo para Tiny definido.', array(
         'order_ref' => $order_id_original,
         'order_id' => $order_id,
@@ -4310,6 +4425,27 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
     ));
 
     $attempts = array(
+        array(
+            'label' => 'dados_pedido_json_body_query_params',
+            'endpoint' => add_query_arg(array(
+                'token' => $token_value,
+                'id' => $order_id,
+                'formato' => 'JSON',
+            ), $endpoint),
+            'body' => array(
+                'dados_pedido' => $dados_pedido,
+            ),
+            'json_body' => true,
+            'headers' => array(
+                'Content-Type' => 'application/json; charset=utf-8',
+            ),
+            'log_body' => array(
+                'token' => '***',
+                'id' => $order_id,
+                'formato' => 'JSON',
+                'dados_pedido' => $dados_pedido,
+            ),
+        ),
         array(
             'label' => 'dados_pedido_strict_layout_json',
             'body' => array(
@@ -4544,10 +4680,19 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
             'request_body' => $request_body_log,
         ));
 
+        $request_endpoint = isset($attempt['endpoint']) && is_string($attempt['endpoint']) && $attempt['endpoint'] !== ''
+            ? (string) $attempt['endpoint']
+            : $endpoint;
         $http_args = array(
             'timeout' => 25,
             'body' => $request_body,
         );
+        if (isset($attempt['json_body']) && $attempt['json_body']) {
+            $http_args['body'] = wp_json_encode($request_body);
+            $http_args['headers'] = isset($attempt['headers']) && is_array($attempt['headers'])
+                ? $attempt['headers']
+                : array('Content-Type' => 'application/json; charset=utf-8');
+        }
         if (isset($attempt['raw_body']) && is_string($attempt['raw_body']) && $attempt['raw_body'] !== '') {
             $http_args['body'] = (string) $attempt['raw_body'];
             $http_args['headers'] = array(
@@ -4555,7 +4700,7 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
             );
         }
 
-        $response = wp_remote_post($endpoint, $http_args);
+        $response = wp_remote_post($request_endpoint, $http_args);
 
         if (is_wp_error($response)) {
             nsr_log_tiny_debug('Erro HTTP no envio Tiny.', array(
