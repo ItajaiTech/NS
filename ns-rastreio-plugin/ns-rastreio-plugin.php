@@ -4071,7 +4071,7 @@ function nsr_build_tiny_obs_text($session, $serials_by_sku) {
         }
     }
 
-    $text = implode(', ', $only_serials);
+    $text = implode("\n", $only_serials);
     $max_len = defined('NSR_TINY_OBS_MAX_LEN') ? max(300, (int) NSR_TINY_OBS_MAX_LEN) : 1800;
 
     if (strlen($text) > $max_len) {
@@ -4388,7 +4388,7 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
     }
 
     $obs_text = nsr_build_tiny_obs_text($session, $serials_by_sku);
-    $obs_text_single_line = str_replace(array("\r\n", "\r", "\n"), ' | ', $obs_text);
+    $obs_text_single_line = str_replace(array("\r\n", "\r"), "\n", $obs_text);
     $obs_text_single_line = mb_substr($obs_text_single_line, 0, 100);
 
     $endpoint = defined('NSR_TINY_PEDIDO_ALTERAR_URL') && trim((string) NSR_TINY_PEDIDO_ALTERAR_URL) !== ''
