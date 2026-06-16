@@ -4174,6 +4174,122 @@ function nsr_tiny_append_unique_limited($base, $addition, $max_len = 100) {
 }
 
 /**
+ * Acrescenta NS na observacao do item sem duplicar valores ja existentes.
+ *
+ * @param string $current_obs
+ * @param array  $serials
+ * @return string
+ */
+function nsr_tiny_append_serials_to_item_obs($current_obs, $serials) {
+    $lines = array();
+    $seen = array();
+
+    $current_obs = nsr_tiny_normalize_short_obs($current_obs);
+    if ($current_obs !== '') {
+        foreach (preg_split("/\n+/", $current_obs) as $line) {
+            $line = trim((string) $line);
+            if ($line === '') {
+                continue;
+            }
+
+            $lines[] = $line;
+            $norm = nsr_normalize_lookup_value($line);
+            if ($norm !== '') {
+                $seen[$norm] = true;
+            }
+        }
+    }
+
+    foreach ($serials as $ns) {
+        $ns = trim((string) $ns);
+        $norm = nsr_normalize_lookup_value($ns);
+        if ($ns === '' || $norm === '' || isset($seen[$norm])) {
+            continue;
+        }
+
+        $lines[] = $ns;
+        $seen[$norm] = true;
+    }
+
+    return implode("\n", $lines);
+}
+
+/**
+ * Monta lista de itens do Tiny preservando dados atuais e colocando os NS no obs do item.
+ *
+ * @param array $pedido
+ * @param array $serials_by_sku
+ * @return array
+ */
+function nsr_build_tiny_items_with_serial_obs($pedido, $serials_by_sku) {
+    if (
+        !is_array($pedido) ||
+        empty($pedido['itens']) ||
+        !is_array($pedido['itens']) ||
+        empty($serials_by_sku)
+    ) {
+        return array();
+    }
+
+    $serials_by_code = array();
+    foreach ($serials_by_sku as $sku => $serials) {
+        $code = strtoupper(trim((string) $sku));
+        if ($code !== '' && is_array($serials) && !empty($serials)) {
+            $serials_by_code[$code] = $serials;
+        }
+    }
+
+    if (empty($serials_by_code)) {
+        return array();
+    }
+
+    $items = array();
+    foreach ($pedido['itens'] as $entry) {
+        if (!is_array($entry)) {
+            continue;
+        }
+
+        $item = isset($entry['item']) && is_array($entry['item']) ? $entry['item'] : $entry;
+        $codigo = isset($item['codigo']) ? strtoupper(trim((string) $item['codigo'])) : '';
+        if ($codigo === '' || !isset($serials_by_code[$codigo])) {
+            continue;
+        }
+
+        $normalized = array();
+        $allowed_fields = array(
+            'id_produto',
+            'codigo',
+            'descricao',
+            'unidade',
+            'quantidade',
+            'valor_unitario',
+        );
+
+        foreach ($allowed_fields as $field_name) {
+            if (!isset($item[$field_name])) {
+                continue;
+            }
+
+            $value = trim((string) $item[$field_name]);
+            if ($value !== '') {
+                $normalized[$field_name] = $value;
+            }
+        }
+
+        if (empty($normalized['codigo'])) {
+            $normalized['codigo'] = $codigo;
+        }
+
+        $current_obs = isset($item['obs']) ? (string) $item['obs'] : '';
+        $normalized['obs'] = nsr_tiny_append_serials_to_item_obs($current_obs, $serials_by_code[$codigo]);
+
+        $items[] = array('item' => $normalized);
+    }
+
+    return $items;
+}
+
+/**
  * Monta observacoes preservando conteudo ja existente no Tiny.
  *
  * @param array  $pedido
@@ -4181,7 +4297,7 @@ function nsr_tiny_append_unique_limited($base, $addition, $max_len = 100) {
  * @return array
  */
 function nsr_tiny_merge_existing_observations($pedido, $new_internal_obs) {
-    $max_len = 100;
+    $max_len = defined('NSR_TINY_OBS_MAX_LEN') ? max(100, (int) NSR_TINY_OBS_MAX_LEN) : 1800;
     $current_internal = isset($pedido['obs_interna']) ? nsr_tiny_normalize_short_obs((string) $pedido['obs_interna']) : '';
     $current_public = isset($pedido['obs']) ? nsr_tiny_normalize_short_obs((string) $pedido['obs']) : '';
     $new_internal_obs = nsr_tiny_normalize_short_obs($new_internal_obs);
@@ -4388,8 +4504,8 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
     }
 
     $obs_text = nsr_build_tiny_obs_text($session, $serials_by_sku);
-    $obs_text_single_line = str_replace(array("\r\n", "\r"), "\n", $obs_text);
-    $obs_text_single_line = mb_substr($obs_text_single_line, 0, 100);
+    $serials_count = array_sum(array_map('count', $serials_by_sku));
+    $obs_text_single_line = nsr_tiny_normalize_short_obs($obs_text);
 
     $endpoint = defined('NSR_TINY_PEDIDO_ALTERAR_URL') && trim((string) NSR_TINY_PEDIDO_ALTERAR_URL) !== ''
         ? (string) NSR_TINY_PEDIDO_ALTERAR_URL
@@ -4665,6 +4781,19 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
                 'dados_pedido[obs]' => $obs_text,
             ),
         );
+    }
+
+    if (!empty($tiny_items_with_serials)) {
+        $attempts = array_values(array_filter($attempts, function($attempt) {
+            $attempt_label = isset($attempt['label']) ? (string) $attempt['label'] : '';
+            if (stripos($attempt_label, 'nested_fields') !== false) {
+                return false;
+            }
+            if (stripos($attempt_label, 'with_id') !== false) {
+                return false;
+            }
+            return true;
+        }));
     }
 
     $last_error_msg = '';
