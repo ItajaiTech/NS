@@ -4071,14 +4071,80 @@ function nsr_build_tiny_obs_text($session, $serials_by_sku) {
         }
     }
 
-    $text = implode("\n", $only_serials);
-    $max_len = defined('NSR_TINY_OBS_MAX_LEN') ? max(300, (int) NSR_TINY_OBS_MAX_LEN) : 1800;
+    return implode("\n", $only_serials);
+}
 
-    if (strlen($text) > $max_len) {
-        $text = substr($text, 0, $max_len - 15) . '...(truncado)';
+/**
+ * Divide os NS em blocos respeitando limite de caracteres por envio.
+ *
+ * @param array $serials_by_sku
+ * @param int   $max_len
+ * @return array
+ */
+function nsr_build_tiny_obs_chunks_from_serials($serials_by_sku, $max_len = 95) {
+    $max_len = max(30, (int) $max_len);
+    $only_serials = array();
+    $seen = array();
+
+    foreach ($serials_by_sku as $sku => $sku_serials) {
+        if (!is_array($sku_serials)) {
+            continue;
+        }
+
+        foreach ($sku_serials as $ns) {
+            $value = trim((string) $ns);
+            if ($value === '') {
+                continue;
+            }
+
+            $norm = nsr_normalize_lookup_value($value);
+            if ($norm === '' || isset($seen[$norm])) {
+                continue;
+            }
+
+            $seen[$norm] = true;
+            $only_serials[] = $value;
+        }
     }
 
-    return $text;
+    if (empty($only_serials)) {
+        return array();
+    }
+
+    $chunks = array();
+    $current_chunk = array();
+    $current_len = 0;
+
+    foreach ($only_serials as $serial) {
+        $serial_len = mb_strlen($serial);
+        if ($serial_len > $max_len) {
+            if (!empty($current_chunk)) {
+                $chunks[] = implode("\n", $current_chunk);
+                $current_chunk = array();
+                $current_len = 0;
+            }
+
+            $chunks[] = mb_substr($serial, 0, $max_len);
+            continue;
+        }
+
+        $extra_len = $current_len > 0 ? 1 + $serial_len : $serial_len;
+        if ($current_len > 0 && ($current_len + $extra_len) > $max_len) {
+            $chunks[] = implode("\n", $current_chunk);
+            $current_chunk = array($serial);
+            $current_len = $serial_len;
+            continue;
+        }
+
+        $current_chunk[] = $serial;
+        $current_len += $extra_len;
+    }
+
+    if (!empty($current_chunk)) {
+        $chunks[] = implode("\n", $current_chunk);
+    }
+
+    return $chunks;
 }
 
 /**
@@ -4299,29 +4365,13 @@ function nsr_build_tiny_items_with_serial_obs($pedido, $serials_by_sku) {
 function nsr_tiny_merge_existing_observations($pedido, $new_internal_obs) {
     $max_len = defined('NSR_TINY_OBS_MAX_LEN') ? max(100, (int) NSR_TINY_OBS_MAX_LEN) : 1800;
     $current_internal = isset($pedido['obs_interna']) ? nsr_tiny_normalize_short_obs((string) $pedido['obs_interna']) : '';
-    $current_public = isset($pedido['obs']) ? nsr_tiny_normalize_short_obs((string) $pedido['obs']) : '';
     $new_internal_obs = nsr_tiny_normalize_short_obs($new_internal_obs);
 
-    $already_in_internal = $current_internal !== '' && $new_internal_obs !== '' && stripos($current_internal, $new_internal_obs) !== false;
-    $would_overflow_internal = false;
-    if ($current_internal !== '' && $new_internal_obs !== '' && !$already_in_internal) {
-        $would_overflow_internal = mb_strlen($current_internal . "\n" . $new_internal_obs) > $max_len;
-    }
-
     $merged_internal = nsr_tiny_append_unique_limited($current_internal, $new_internal_obs, $max_len);
-    $merged_public = $current_public;
-    $moved_internal_to_public = false;
-
-    if ($would_overflow_internal) {
-        $merged_public = nsr_tiny_append_unique_limited($current_public, $current_internal, $max_len);
-        $moved_internal_to_public = $merged_public !== $current_public;
-    }
 
     return array(
         'obs_interna' => $merged_internal,
-        'obs' => $merged_public,
         'had_internal_obs' => $current_internal !== '',
-        'moved_internal_to_public' => $moved_internal_to_public,
     );
 }
 
@@ -4447,11 +4497,6 @@ function nsr_build_tiny_dados_pedido_strict_layout($token, $order_id, $obs_text,
 
     $payload['pagamentos_integrados'] = $integrados;
 
-    // Opcionalmente replica o mesmo valor no campo publico de observacao.
-    if (defined('NSR_TINY_WRITE_OBS_PUBLIC') && NSR_TINY_WRITE_OBS_PUBLIC) {
-        $payload['obs'] = trim((string) $obs_text);
-    }
-
     return $payload;
 }
 
@@ -4503,9 +4548,13 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
         return new WP_Error('nsr_tiny_empty_serials', 'Nao ha NS bipados para enviar ao Tiny.');
     }
 
-    $obs_text = nsr_build_tiny_obs_text($session, $serials_by_sku);
+    $chunk_max_len = defined('NSR_TINY_OBS_CHUNK_LEN') ? max(30, (int) NSR_TINY_OBS_CHUNK_LEN) : 95;
+    $obs_chunks = nsr_build_tiny_obs_chunks_from_serials($serials_by_sku, $chunk_max_len);
+    if (empty($obs_chunks)) {
+        return new WP_Error('nsr_tiny_empty_serials', 'Nao ha NS validos para enviar ao Tiny.');
+    }
+
     $serials_count = array_sum(array_map('count', $serials_by_sku));
-    $obs_text_single_line = nsr_tiny_normalize_short_obs($obs_text);
 
     $endpoint = defined('NSR_TINY_PEDIDO_ALTERAR_URL') && trim((string) NSR_TINY_PEDIDO_ALTERAR_URL) !== ''
         ? (string) NSR_TINY_PEDIDO_ALTERAR_URL
@@ -4514,382 +4563,352 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
     $token_value = nsr_get_tiny_token_by_system($system_key);
     $order_id_original = $order_id;
     $order_id = nsr_resolve_tiny_internal_order_id($token_value, $order_id_original);
-    $tiny_order_details = nsr_tiny_get_order_details($token_value, $order_id);
-    $merged_obs = nsr_tiny_merge_existing_observations($tiny_order_details, $obs_text_single_line);
-    $dados_pedido = array(
-        'obs_interna' => $merged_obs['obs_interna'],
-    );
-
-    if (
-        $merged_obs['moved_internal_to_public'] ||
-        (defined('NSR_TINY_WRITE_OBS_PUBLIC') && NSR_TINY_WRITE_OBS_PUBLIC)
-    ) {
-        $dados_pedido['obs'] = $merged_obs['obs'];
-    }
-
-    if ($merged_obs['had_internal_obs']) {
-        nsr_log_tiny_debug('Observacao interna existente preservada no envio Tiny.', array(
-            'order_id' => $order_id,
-            'moved_internal_to_public' => $merged_obs['moved_internal_to_public'] ? 'yes' : 'no',
-            'obs_interna_len' => mb_strlen((string) $dados_pedido['obs_interna']),
-            'obs_len' => isset($dados_pedido['obs']) ? mb_strlen((string) $dados_pedido['obs']) : 0,
-        ));
-    }
-
-    $dados_pedido_strict = nsr_build_tiny_dados_pedido_strict_layout($token_value, $order_id, $dados_pedido['obs_interna'], $tiny_order_details);
-    if (isset($dados_pedido['obs'])) {
-        $dados_pedido_strict['obs'] = $dados_pedido['obs'];
-    }
     nsr_log_tiny_debug('Pedido alvo para Tiny definido.', array(
         'order_ref' => $order_id_original,
         'order_id' => $order_id,
         'system' => $system_key,
+        'chunks_total' => count($obs_chunks),
+        'chunk_max_len' => $chunk_max_len,
     ));
+    $last_error_msg = '';
+    $chunks_sent = 0;
+    $chunks_total = count($obs_chunks);
 
-    $attempts = array(
-        array(
-            'label' => 'dados_pedido_json_body_query_params',
-            'endpoint' => add_query_arg(array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'JSON',
-            ), $endpoint),
-            'body' => array(
-                'dados_pedido' => $dados_pedido,
+    foreach ($obs_chunks as $chunk_index => $obs_text) {
+        $obs_text_single_line = nsr_tiny_normalize_short_obs($obs_text);
+        $tiny_order_details = nsr_tiny_get_order_details($token_value, $order_id);
+        $merged_obs = nsr_tiny_merge_existing_observations($tiny_order_details, $obs_text_single_line);
+        $dados_pedido = array(
+            'obs_interna' => $merged_obs['obs_interna'],
+        );
+
+        if ($merged_obs['had_internal_obs']) {
+            nsr_log_tiny_debug('Observacao interna existente preservada no envio Tiny.', array(
+                'order_id' => $order_id,
+                'chunk_index' => ($chunk_index + 1),
+                'chunks_total' => $chunks_total,
+                'obs_interna_len' => mb_strlen((string) $dados_pedido['obs_interna']),
+            ));
+        }
+
+        $dados_pedido_strict = nsr_build_tiny_dados_pedido_strict_layout($token_value, $order_id, $dados_pedido['obs_interna'], $tiny_order_details);
+
+        $tiny_items_with_serials = array();
+        $attempts = array(
+            array(
+                'label' => 'dados_pedido_strict_layout_json',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'dados_pedido' => wp_json_encode($dados_pedido_strict),
+                ),
             ),
-            'json_body' => true,
-            'headers' => array(
-                'Content-Type' => 'application/json; charset=utf-8',
+            array(
+                'label' => 'dados_pedido_strict_layout_array',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'dados_pedido' => $dados_pedido_strict,
+                ),
             ),
-            'log_body' => array(
-                'token' => '***',
-                'id' => $order_id,
-                'formato' => 'JSON',
-                'dados_pedido' => $dados_pedido,
+            array(
+                'label' => 'dados_pedido_strict_layout_raw',
+                'raw_body' => 'token=' . urlencode((string) $token_value)
+                    . '&id=' . urlencode((string) $order_id)
+                    . '&formato=json'
+                    . '&dados_pedido=' . urlencode((string) wp_json_encode($dados_pedido_strict)),
+                'log_body' => array(
+                    'token' => '***',
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'dados_pedido' => '[strict layout json]',
+                ),
             ),
-        ),
-        array(
-            'label' => 'dados_pedido_strict_layout_json',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'dados_pedido' => wp_json_encode($dados_pedido_strict),
+            array(
+                'label' => 'dados_pedido_strict_layout_wrapped_json',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'dados_pedido' => wp_json_encode(array('dados_pedido' => $dados_pedido_strict)),
+                ),
             ),
-        ),
-        array(
-            'label' => 'dados_pedido_strict_layout_array',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'dados_pedido' => $dados_pedido_strict,
+            array(
+                'label' => 'dados_pedido_json_flat',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'dados_pedido' => wp_json_encode($dados_pedido),
+                ),
             ),
-        ),
-        array(
-            'label' => 'dados_pedido_strict_layout_raw',
-            'raw_body' => 'token=' . urlencode((string) $token_value)
-                . '&id=' . urlencode((string) $order_id)
-                . '&formato=json'
-                . '&dados_pedido=' . urlencode((string) wp_json_encode($dados_pedido_strict)),
-            'log_body' => array(
-                'token' => '***',
-                'id' => $order_id,
-                'formato' => 'json',
-                'dados_pedido' => '[strict layout json]',
+            array(
+                'label' => 'dados_pedido_json_wrapped',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'dados_pedido' => wp_json_encode(array('pedido' => $dados_pedido)),
+                ),
             ),
-        ),
-        array(
-            'label' => 'dados_pedido_strict_layout_wrapped_json',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'dados_pedido' => wp_json_encode(array('dados_pedido' => $dados_pedido_strict)),
+            array(
+                'label' => 'pedido_json_flat',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'pedido' => wp_json_encode($dados_pedido),
+                ),
             ),
-        ),
-        array(
-            'label' => 'dados_pedido_json_flat',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'dados_pedido' => wp_json_encode($dados_pedido),
+            array(
+                'label' => 'pedido_json_wrapped',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'pedido' => wp_json_encode(array('pedido' => $dados_pedido)),
+                ),
             ),
-        ),
-        array(
-            'label' => 'dados_pedido_json_wrapped',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'dados_pedido' => wp_json_encode(array('pedido' => $dados_pedido)),
+            array(
+                'label' => 'dados_pedido_array',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'dados_pedido' => $dados_pedido,
+                ),
             ),
-        ),
-        array(
-            'label' => 'pedido_json_flat',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'pedido' => wp_json_encode($dados_pedido),
+            array(
+                'label' => 'pedido_array',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'pedido' => $dados_pedido,
+                ),
             ),
-        ),
-        array(
-            'label' => 'pedido_json_wrapped',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'pedido' => wp_json_encode(array('pedido' => $dados_pedido)),
+            array(
+                'label' => 'dados_pedido_array_wrapped',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'dados_pedido' => array('pedido' => $dados_pedido),
+                ),
             ),
-        ),
-        array(
-            'label' => 'dados_pedido_array',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'dados_pedido' => $dados_pedido,
+            array(
+                'label' => 'pedido_array_wrapped',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'pedido' => array('pedido' => $dados_pedido),
+                ),
             ),
-        ),
-        array(
-            'label' => 'pedido_array',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'pedido' => $dados_pedido,
+            array(
+                'label' => 'pedido_nested_fields',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'pedido[obs_interna]' => $obs_text,
+                ),
             ),
-        ),
-        array(
-            'label' => 'dados_pedido_array_wrapped',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'dados_pedido' => array('pedido' => $dados_pedido),
+            array(
+                'label' => 'dados_pedido_nested_fields',
+                'body' => array(
+                    'token' => $token_value,
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'dados_pedido[obs_interna]' => $obs_text,
+                ),
             ),
-        ),
-        array(
-            'label' => 'pedido_array_wrapped',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'pedido' => array('pedido' => $dados_pedido),
+            array(
+                'label' => 'dados_pedido_json_urlencoded_raw',
+                'raw_body' => 'token=' . urlencode((string) $token_value)
+                    . '&id=' . urlencode((string) $order_id)
+                    . '&formato=json'
+                    . '&dados_pedido=' . urlencode((string) wp_json_encode($dados_pedido)),
+                'log_body' => array(
+                    'token' => '***',
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'dados_pedido' => '[urlencoded json]',
+                ),
             ),
-        ),
-        array(
-            'label' => 'pedido_nested_fields',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'pedido[obs_interna]' => $obs_text,
+            array(
+                'label' => 'dados_pedido_json_urlencoded_raw_unescaped',
+                'raw_body' => 'token=' . urlencode((string) $token_value)
+                    . '&id=' . urlencode((string) $order_id)
+                    . '&formato=JSON'
+                    . '&dados_pedido=' . urlencode((string) json_encode($dados_pedido, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)),
+                'log_body' => array(
+                    'token' => '***',
+                    'id' => $order_id,
+                    'formato' => 'JSON',
+                    'dados_pedido' => '[urlencoded json unescaped]',
+                ),
             ),
-        ),
-        array(
-            'label' => 'dados_pedido_nested_fields',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'dados_pedido[obs_interna]' => $obs_text,
-            ),
-        ),
-        array(
-            'label' => 'dados_pedido_json_urlencoded_raw',
-            'raw_body' => 'token=' . urlencode((string) $token_value)
-                . '&id=' . urlencode((string) $order_id)
-                . '&formato=json'
-                . '&dados_pedido=' . urlencode((string) wp_json_encode($dados_pedido)),
-            'log_body' => array(
-                'token' => '***',
-                'id' => $order_id,
-                'formato' => 'json',
-                'dados_pedido' => '[urlencoded json]',
-            ),
-        ),
-        array(
-            'label' => 'dados_pedido_json_urlencoded_raw_unescaped',
-            'raw_body' => 'token=' . urlencode((string) $token_value)
-                . '&id=' . urlencode((string) $order_id)
-                . '&formato=JSON'
-                . '&dados_pedido=' . urlencode((string) json_encode($dados_pedido, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)),
-            'log_body' => array(
-                'token' => '***',
-                'id' => $order_id,
-                'formato' => 'JSON',
-                'dados_pedido' => '[urlencoded json unescaped]',
-            ),
-        ),
-        array(
-            'label' => 'dados_pedido_json_with_id_raw',
-            'raw_body' => 'token=' . urlencode((string) $token_value)
-                . '&id=' . urlencode((string) $order_id)
-                . '&formato=JSON'
-                . '&dados_pedido=' . urlencode((string) json_encode(array(
-                    'id' => (string) $order_id,
-                    'obs_interna' => $obs_text_single_line,
-                ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)),
-            'log_body' => array(
-                'token' => '***',
-                'id' => $order_id,
-                'formato' => 'JSON',
-                'dados_pedido' => '[json with id + obs_interna]',
-            ),
-        ),
-        array(
-            'label' => 'dados_pedido_pedido_wrapped_with_id_raw',
-            'raw_body' => 'token=' . urlencode((string) $token_value)
-                . '&id=' . urlencode((string) $order_id)
-                . '&formato=JSON'
-                . '&dados_pedido=' . urlencode((string) json_encode(array(
-                    'pedido' => array(
+            array(
+                'label' => 'dados_pedido_json_with_id_raw',
+                'raw_body' => 'token=' . urlencode((string) $token_value)
+                    . '&id=' . urlencode((string) $order_id)
+                    . '&formato=JSON'
+                    . '&dados_pedido=' . urlencode((string) json_encode(array(
                         'id' => (string) $order_id,
                         'obs_interna' => $obs_text_single_line,
-                    ),
-                ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)),
-            'log_body' => array(
-                'token' => '***',
-                'id' => $order_id,
-                'formato' => 'JSON',
-                'dados_pedido' => '[json wrapped pedido with id + obs_interna]',
+                    ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)),
+                'log_body' => array(
+                    'token' => '***',
+                    'id' => $order_id,
+                    'formato' => 'JSON',
+                    'dados_pedido' => '[json with id + obs_interna]',
+                ),
             ),
-        ),
-    );
-
-    if (defined('NSR_TINY_WRITE_OBS_PUBLIC') && NSR_TINY_WRITE_OBS_PUBLIC) {
-        $attempts[] = array(
-            'label' => 'pedido_nested_fields_with_obs',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'pedido[obs_interna]' => $obs_text,
-                'pedido[obs]' => $obs_text,
-            ),
-        );
-        $attempts[] = array(
-            'label' => 'dados_pedido_nested_fields_with_obs',
-            'body' => array(
-                'token' => $token_value,
-                'id' => $order_id,
-                'formato' => 'json',
-                'dados_pedido[obs_interna]' => $obs_text,
-                'dados_pedido[obs]' => $obs_text,
+            array(
+                'label' => 'dados_pedido_pedido_wrapped_with_id_raw',
+                'raw_body' => 'token=' . urlencode((string) $token_value)
+                    . '&id=' . urlencode((string) $order_id)
+                    . '&formato=JSON'
+                    . '&dados_pedido=' . urlencode((string) json_encode(array(
+                        'pedido' => array(
+                            'id' => (string) $order_id,
+                            'obs_interna' => $obs_text_single_line,
+                        ),
+                    ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)),
+                'log_body' => array(
+                    'token' => '***',
+                    'id' => $order_id,
+                    'formato' => 'JSON',
+                    'dados_pedido' => '[json wrapped pedido with id + obs_interna]',
+                ),
             ),
         );
-    }
 
-    if (!empty($tiny_items_with_serials)) {
-        $attempts = array_values(array_filter($attempts, function($attempt) {
-            $attempt_label = isset($attempt['label']) ? (string) $attempt['label'] : '';
-            if (stripos($attempt_label, 'nested_fields') !== false) {
-                return false;
+        if (!empty($tiny_items_with_serials)) {
+            $attempts = array_values(array_filter($attempts, function($attempt) {
+                $attempt_label = isset($attempt['label']) ? (string) $attempt['label'] : '';
+                if (stripos($attempt_label, 'nested_fields') !== false) {
+                    return false;
+                }
+                if (stripos($attempt_label, 'with_id') !== false) {
+                    return false;
+                }
+                return true;
+            }));
+        }
+
+        $last_error_msg = '';
+        foreach ($attempts as $attempt) {
+            $attempt_label = isset($attempt['label']) ? (string) $attempt['label'] : 'unknown';
+            $request_body = isset($attempt['body']) && is_array($attempt['body']) ? $attempt['body'] : array();
+            $request_body_log = isset($attempt['log_body']) && is_array($attempt['log_body'])
+                ? $attempt['log_body']
+                : $request_body;
+            if (isset($request_body_log['token']) && $request_body_log['token'] !== '***') {
+                $request_body_log['token'] = '***';
             }
-            if (stripos($attempt_label, 'with_id') !== false) {
-                return false;
-            }
-            return true;
-        }));
-    }
 
-    $last_error_msg = '';
-    foreach ($attempts as $attempt) {
-        $attempt_label = isset($attempt['label']) ? (string) $attempt['label'] : 'unknown';
-        $request_body = isset($attempt['body']) && is_array($attempt['body']) ? $attempt['body'] : array();
-        $request_body_log = isset($attempt['log_body']) && is_array($attempt['log_body'])
-            ? $attempt['log_body']
-            : $request_body;
-        if (isset($request_body_log['token']) && $request_body_log['token'] !== '***') {
-            $request_body_log['token'] = '***';
-        }
-
-        nsr_log_tiny_debug('Enviando request para Tiny.', array(
-            'system' => $system_key,
-            'order_id' => $order_id,
-            'endpoint' => $endpoint,
-            'attempt' => $attempt_label,
-            'request_body' => $request_body_log,
-        ));
-
-        $request_endpoint = isset($attempt['endpoint']) && is_string($attempt['endpoint']) && $attempt['endpoint'] !== ''
-            ? (string) $attempt['endpoint']
-            : $endpoint;
-        $http_args = array(
-            'timeout' => 25,
-            'body' => $request_body,
-        );
-        if (isset($attempt['json_body']) && $attempt['json_body']) {
-            $http_args['body'] = wp_json_encode($request_body);
-            $http_args['headers'] = isset($attempt['headers']) && is_array($attempt['headers'])
-                ? $attempt['headers']
-                : array('Content-Type' => 'application/json; charset=utf-8');
-        }
-        if (isset($attempt['raw_body']) && is_string($attempt['raw_body']) && $attempt['raw_body'] !== '') {
-            $http_args['body'] = (string) $attempt['raw_body'];
-            $http_args['headers'] = array(
-                'Content-Type' => 'application/x-www-form-urlencoded; charset=utf-8',
-            );
-        }
-
-        $response = wp_remote_post($request_endpoint, $http_args);
-
-        if (is_wp_error($response)) {
-            nsr_log_tiny_debug('Erro HTTP no envio Tiny.', array(
+            nsr_log_tiny_debug('Enviando request para Tiny.', array(
                 'system' => $system_key,
                 'order_id' => $order_id,
-                'error' => $response->get_error_message(),
+                'endpoint' => $endpoint,
+                'chunk_index' => ($chunk_index + 1),
+                'chunks_total' => $chunks_total,
+                'attempt' => $attempt_label,
+                'request_body' => $request_body_log,
             ));
-            return new WP_Error('nsr_tiny_http_error', 'Erro de comunicacao com Tiny: ' . $response->get_error_message());
-        }
 
-        $body = wp_remote_retrieve_body($response);
-        $data = json_decode((string) $body, true);
-        if (!is_array($data) || !isset($data['retorno'])) {
-            nsr_log_tiny_debug('Resposta Tiny invalida.', array(
+            $request_endpoint = isset($attempt['endpoint']) && is_string($attempt['endpoint']) && $attempt['endpoint'] !== ''
+                ? (string) $attempt['endpoint']
+                : $endpoint;
+            $http_args = array(
+                'timeout' => 25,
+                'body' => $request_body,
+            );
+            if (isset($attempt['json_body']) && $attempt['json_body']) {
+                $http_args['body'] = wp_json_encode($request_body);
+                $http_args['headers'] = isset($attempt['headers']) && is_array($attempt['headers'])
+                    ? $attempt['headers']
+                    : array('Content-Type' => 'application/json; charset=utf-8');
+            }
+            if (isset($attempt['raw_body']) && is_string($attempt['raw_body']) && $attempt['raw_body'] !== '') {
+                $http_args['body'] = (string) $attempt['raw_body'];
+                $http_args['headers'] = array(
+                    'Content-Type' => 'application/x-www-form-urlencoded; charset=utf-8',
+                );
+            }
+
+            $response = wp_remote_post($request_endpoint, $http_args);
+
+            if (is_wp_error($response)) {
+                nsr_log_tiny_debug('Erro HTTP no envio Tiny.', array(
+                    'system' => $system_key,
+                    'order_id' => $order_id,
+                    'chunk_index' => ($chunk_index + 1),
+                    'error' => $response->get_error_message(),
+                ));
+                return new WP_Error('nsr_tiny_http_error', 'Erro de comunicacao com Tiny: ' . $response->get_error_message());
+            }
+
+            $body = wp_remote_retrieve_body($response);
+            $data = json_decode((string) $body, true);
+            if (!is_array($data) || !isset($data['retorno'])) {
+                nsr_log_tiny_debug('Resposta Tiny invalida.', array(
+                    'system' => $system_key,
+                    'order_id' => $order_id,
+                    'chunk_index' => ($chunk_index + 1),
+                    'http_code' => wp_remote_retrieve_response_code($response),
+                    'response_body' => $body,
+                ));
+                return new WP_Error('nsr_tiny_invalid_response', 'Retorno inesperado do Tiny ao atualizar pedido.');
+            }
+
+            $retorno = $data['retorno'];
+            $status = isset($retorno['status']) ? strtoupper(trim((string) $retorno['status'])) : '';
+            if ($status === 'OK') {
+                nsr_log_tiny_debug('Lote Tiny enviado com sucesso.', array(
+                    'system' => $system_key,
+                    'order_id' => $order_id,
+                    'chunk_index' => ($chunk_index + 1),
+                    'chunks_total' => $chunks_total,
+                ));
+                $last_error_msg = '';
+                $chunks_sent++;
+                break;
+            }
+
+            $erro_msg = 'Falha ao atualizar observacao no Tiny.';
+            if (isset($retorno['erros'][0]['erro']) && trim((string) $retorno['erros'][0]['erro']) !== '') {
+                $erro_msg = trim((string) $retorno['erros'][0]['erro']);
+            }
+
+            $last_error_msg = $erro_msg;
+            nsr_log_tiny_debug('Tiny retornou erro de negocio.', array(
                 'system' => $system_key,
                 'order_id' => $order_id,
-                'http_code' => wp_remote_retrieve_response_code($response),
+                'chunk_index' => ($chunk_index + 1),
+                'attempt' => $attempt_label,
+                'error' => $erro_msg,
                 'response_body' => $body,
             ));
-            return new WP_Error('nsr_tiny_invalid_response', 'Retorno inesperado do Tiny ao atualizar pedido.');
+
+            $is_missing_data_error = stripos($erro_msg, 'dados do pedido nao informados') !== false
+                || stripos($erro_msg, 'dados do pedido não informados') !== false;
+            $is_token_error = stripos($erro_msg, 'token invalido') !== false
+                || stripos($erro_msg, 'token inválido') !== false;
+
+            // Continua para o proximo fallback quando o Tiny rejeita apenas um formato especifico.
+            if (!$is_missing_data_error && !$is_token_error) {
+                break;
+            }
         }
 
-        $retorno = $data['retorno'];
-        $status = isset($retorno['status']) ? strtoupper(trim((string) $retorno['status'])) : '';
-        if ($status === 'OK') {
-            nsr_log_tiny_debug('Envio Tiny concluido com sucesso.', array(
-                'system' => $system_key,
-                'order_id' => $order_id,
-                'serials_count' => array_sum(array_map('count', $serials_by_sku)),
-            ));
-            $last_error_msg = '';
-            break;
+        if ($last_error_msg !== '') {
+            return new WP_Error('nsr_tiny_api_error', 'Lote ' . ($chunk_index + 1) . '/' . $chunks_total . ': ' . $last_error_msg);
         }
-
-        $erro_msg = 'Falha ao atualizar observacao no Tiny.';
-        if (isset($retorno['erros'][0]['erro']) && trim((string) $retorno['erros'][0]['erro']) !== '') {
-            $erro_msg = trim((string) $retorno['erros'][0]['erro']);
-        }
-
-        $last_error_msg = $erro_msg;
-        nsr_log_tiny_debug('Tiny retornou erro de negocio.', array(
-            'system' => $system_key,
-            'order_id' => $order_id,
-            'attempt' => $attempt_label,
-            'error' => $erro_msg,
-            'response_body' => $body,
-        ));
-        if (stripos($erro_msg, 'dados do pedido nao informados') === false && stripos($erro_msg, 'dados do pedido não informados') === false) {
-            break;
-        }
-    }
-
-    if ($last_error_msg !== '') {
-        return new WP_Error('nsr_tiny_api_error', $last_error_msg);
     }
 
     return array(
@@ -4897,6 +4916,8 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
         'system' => $system_key,
         'system_label' => $systems[$system_key],
         'order_id' => $order_id,
+        'chunks_total' => $chunks_total,
+        'chunks_sent' => $chunks_sent,
         'serials_count' => array_sum(array_map('count', $serials_by_sku)),
     );
 }
@@ -5214,10 +5235,13 @@ function nsr_ajax_send_tiny_serials() {
     }
 
     $msg = sprintf(
-        'Tiny %s atualizado com sucesso no pedido %s (%d NS enviado(s)).',
+        'Tiny %s atualizado com sucesso no pedido %s (%d NS enviado(s)%s).',
         isset($tiny_result['system_label']) ? (string) $tiny_result['system_label'] : strtoupper($tiny_system),
         isset($tiny_result['order_id']) ? (string) $tiny_result['order_id'] : '-',
-        isset($tiny_result['serials_count']) ? (int) $tiny_result['serials_count'] : 0
+        isset($tiny_result['serials_count']) ? (int) $tiny_result['serials_count'] : 0,
+        isset($tiny_result['chunks_sent']) && isset($tiny_result['chunks_total'])
+            ? (' em ' . (int) $tiny_result['chunks_sent'] . '/' . (int) $tiny_result['chunks_total'] . ' lote(s)')
+            : ''
     );
 
     wp_send_json_success(array('msg' => $msg));
