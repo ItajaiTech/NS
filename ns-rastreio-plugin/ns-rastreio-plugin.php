@@ -2515,7 +2515,7 @@ function nsr_recompute_scan_session_flags($session) {
     foreach ($skus as $sku) {
         if (!isset($products_map[$sku])) {
             $missing_skus[] = $sku;
-        } elseif ((string) $session['itens'][$sku]['descricao'] === '') {
+        } elseif (empty($session['itens'][$sku]['descricao'])) {
             $session['itens'][$sku]['descricao'] = (string) $products_map[$sku];
         }
     }
@@ -4148,6 +4148,51 @@ function nsr_build_tiny_obs_chunks_from_serials($serials_by_sku, $max_len = 95) 
 }
 
 /**
+ * Compacta sequencias numericas contiguas para caber no campo de observacao
+ * do Tiny, sem alterar os valores isolados ou nao sequenciais.
+ *
+ * Exemplo: 200058450001, 200058450002 => 200058450001-200058450002.
+ *
+ * @param array $serials
+ * @return array
+ */
+function nsr_compact_serial_ranges_for_tiny($serials) {
+    $result = array();
+    $range_start = null;
+    $range_end = null;
+
+    $flush_range = static function() use (&$result, &$range_start, &$range_end) {
+        if ($range_start === null) {
+            return;
+        }
+        $result[] = $range_start === $range_end ? $range_start : $range_start . '-' . $range_end;
+        $range_start = null;
+        $range_end = null;
+    };
+
+    foreach ($serials as $serial) {
+        $serial = trim((string) $serial);
+        $is_contiguous = $range_end !== null
+            && ctype_digit($serial)
+            && ctype_digit($range_end)
+            && strlen($serial) === strlen($range_end)
+            && (int) $serial === ((int) $range_end + 1);
+
+        if ($is_contiguous) {
+            $range_end = $serial;
+            continue;
+        }
+
+        $flush_range();
+        $range_start = $serial;
+        $range_end = $serial;
+    }
+
+    $flush_range();
+    return $result;
+}
+
+/**
  * Busca dados atuais do pedido no Tiny para preservar observacoes existentes.
  *
  * @param string $token
@@ -4217,7 +4262,16 @@ function nsr_tiny_normalize_short_obs($text) {
 function nsr_tiny_append_unique_limited($base, $addition, $max_len = 100) {
     $base = nsr_tiny_normalize_short_obs($base);
     $addition = nsr_tiny_normalize_short_obs($addition);
-    $max_len = max(1, (int) $max_len);
+    $max_len = (int) $max_len;
+
+    if ($max_len <= 0) {
+        if ($addition === '' || stripos($base, $addition) !== false) {
+            return $base;
+        }
+        return $base === '' ? $addition : $base . "\n" . $addition;
+    }
+
+    $max_len = max(1, $max_len);
 
     if ($addition === '') {
         return mb_substr($base, 0, $max_len);
@@ -4363,7 +4417,7 @@ function nsr_build_tiny_items_with_serial_obs($pedido, $serials_by_sku) {
  * @return array
  */
 function nsr_tiny_merge_existing_observations($pedido, $new_internal_obs) {
-    $max_len = defined('NSR_TINY_OBS_MAX_LEN') ? max(100, (int) NSR_TINY_OBS_MAX_LEN) : 1800;
+    $max_len = defined('NSR_TINY_OBS_MAX_LEN') ? (int) NSR_TINY_OBS_MAX_LEN : 0;
     $current_internal = isset($pedido['obs_interna']) ? nsr_tiny_normalize_short_obs((string) $pedido['obs_interna']) : '';
     $new_internal_obs = nsr_tiny_normalize_short_obs($new_internal_obs);
 
@@ -4373,6 +4427,28 @@ function nsr_tiny_merge_existing_observations($pedido, $new_internal_obs) {
         'obs_interna' => $merged_internal,
         'had_internal_obs' => $current_internal !== '',
     );
+}
+
+/**
+ * Indica se a observacao interna contem exclusivamente NS (ou faixas de NS)
+ * gravados pelo plugin, sem texto operacional a preservar.
+ *
+ * @param string $text
+ * @return bool
+ */
+function nsr_tiny_obs_is_only_serial_list($text) {
+    $lines = preg_split('/\R+/', trim((string) $text));
+    if (empty($lines)) {
+        return false;
+    }
+
+    foreach ($lines as $line) {
+        if (!preg_match('/^\d+(?:-\d+)?$/', trim((string) $line))) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 /**
@@ -4548,7 +4624,9 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
         return new WP_Error('nsr_tiny_empty_serials', 'Nao ha NS bipados para enviar ao Tiny.');
     }
 
-    $chunk_max_len = defined('NSR_TINY_OBS_CHUNK_LEN') ? max(30, (int) NSR_TINY_OBS_CHUNK_LEN) : 95;
+    // O ERP aceita a lista completa no campo de observacoes internas. Mantemos
+    // um teto alto somente como protecao contra payloads acidentalmente enormes.
+    $chunk_max_len = defined('NSR_TINY_OBS_CHUNK_LEN') ? max(30, (int) NSR_TINY_OBS_CHUNK_LEN) : 1000000;
     $obs_chunks = nsr_build_tiny_obs_chunks_from_serials($serials_by_sku, $chunk_max_len);
     if (empty($obs_chunks)) {
         return new WP_Error('nsr_tiny_empty_serials', 'Nao ha NS validos para enviar ao Tiny.');
@@ -4577,7 +4655,12 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
     foreach ($obs_chunks as $chunk_index => $obs_text) {
         $obs_text_single_line = nsr_tiny_normalize_short_obs($obs_text);
         $tiny_order_details = nsr_tiny_get_order_details($token_value, $order_id);
-        $merged_obs = nsr_tiny_merge_existing_observations($tiny_order_details, $obs_text_single_line);
+        $current_internal_obs = isset($tiny_order_details['obs_interna'])
+            ? (string) $tiny_order_details['obs_interna']
+            : '';
+        $merged_obs = nsr_tiny_obs_is_only_serial_list($current_internal_obs)
+            ? array('obs_interna' => $obs_text_single_line, 'had_internal_obs' => false)
+            : nsr_tiny_merge_existing_observations($tiny_order_details, $obs_text_single_line);
         $dados_pedido = array(
             'obs_interna' => $merged_obs['obs_interna'],
         );
@@ -4594,7 +4677,28 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
         $dados_pedido_strict = nsr_build_tiny_dados_pedido_strict_layout($token_value, $order_id, $dados_pedido['obs_interna'], $tiny_order_details);
 
         $tiny_items_with_serials = array();
+        // A API 2.0 recebe token e id como parametros da chamada; o conteudo
+        // obrigatorio precisa ser um body JSON cujo elemento raiz e dados_pedido.
+        $tiny_json_endpoint = add_query_arg(array(
+            'token' => $token_value,
+            'id' => $order_id,
+            'formato' => 'json',
+        ), $endpoint);
         $attempts = array(
+            array(
+                'label' => 'api2_json_body',
+                'endpoint' => $tiny_json_endpoint,
+                'json_body' => true,
+                'body' => array(
+                    'dados_pedido' => $dados_pedido,
+                ),
+                'log_body' => array(
+                    'token' => '*** (query)',
+                    'id' => $order_id,
+                    'formato' => 'json',
+                    'dados_pedido' => $dados_pedido,
+                ),
+            ),
             array(
                 'label' => 'dados_pedido_strict_layout_json',
                 'body' => array(
@@ -4786,6 +4890,13 @@ function nsr_send_serials_to_tiny_order($session, $system_key) {
                 ),
             ),
         );
+
+        // O formato JSON acima e o formato oficial da API 2.0. Nao tenta
+        // variacoes antigas: quando o token e recusado, elas apenas multiplicam
+        // requisicoes e podem acionar o limite da API.
+        $attempts = array_values(array_filter($attempts, function($attempt) {
+            return isset($attempt['label']) && $attempt['label'] === 'api2_json_body';
+        }));
 
         if (!empty($tiny_items_with_serials)) {
             $attempts = array_values(array_filter($attempts, function($attempt) {
@@ -5317,7 +5428,8 @@ function nsr_render_admin_page() {
             | <strong>Produtos cadastrados:</strong> <?php echo esc_html((string) $total_products); ?>
         </p>
 
-        <h2>1) Importar planilhas</h2>
+        <section id="nsr-section-import">
+        <h2>3) Importar planilhas</h2>
         <p>Envie arquivos <code>.xlsx</code> ou <code>.csv</code> com cabecalho. Colunas obrigatorias: <code>Observacoes internas</code> (NS), <code>Numero (Nota Fiscal)</code> e <code>Numero</code> (Pedido).</p>
         <p>Colunas opcionais: <code>Codigo (SKU)</code>, <code>Descricao do produto</code>, <code>Quantidade de produtos</code>, <code>Valor total da venda</code>, <code>Data da venda</code>.</p>
 
@@ -5329,7 +5441,7 @@ function nsr_render_admin_page() {
             </p>
         </form>
 
-        <h2>2) Importar base de produtos (SKU x Descricao)</h2>
+        <h2>3.1) Importar base de produtos (SKU x Descricao)</h2>
         <p>Envie arquivo <code>.xlsx</code> ou <code>.csv</code> com colunas de SKU e descricao para validar o pedido do PDF.</p>
         <form method="post" enctype="multipart/form-data" style="margin-bottom:24px;">
             <?php wp_nonce_field('nsr_products_import', 'nsr_products_nonce'); ?>
@@ -5339,7 +5451,7 @@ function nsr_render_admin_page() {
             </p>
         </form>
 
-        <h3>2.1) Cadastro manual rapido de produto</h3>
+        <h3>3.2) Cadastro manual rapido de produto</h3>
         <p>Use este formulario quando chegar SKU novo no pedido (ex.: PRD000XX) e ele ainda nao estiver na base.</p>
         <form method="post" style="margin-bottom:24px;display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;">
             <?php wp_nonce_field('nsr_product_manual', 'nsr_product_manual_nonce'); ?>
@@ -5354,7 +5466,7 @@ function nsr_render_admin_page() {
             <button type="submit" name="nsr_product_manual_submit" class="button button-primary">Salvar produto</button>
         </form>
 
-        <h3>2.2) Integracao Tiny (tokens por sistema)</h3>
+        <h3>3.3) Integracao Tiny (tokens por sistema)</h3>
         <p>Configure um token para cada sistema Tiny: KDT, TEKE e TECH. O envio de NS sera feito manualmente e separado por sistema.</p>
         <form method="post" style="margin-bottom:24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;max-width:820px;">
             <?php wp_nonce_field('nsr_tiny_tokens', 'nsr_tiny_tokens_nonce'); ?>
@@ -5375,7 +5487,10 @@ function nsr_render_admin_page() {
             </div>
         </form>
 
-        <h2>3) Leitura de Pedido de Venda (PDF) e Bipagem de NS</h2>
+        </section>
+
+        <section id="nsr-section-pdf">
+        <h2>1) Leitura de Pedido de Venda (PDF) e Bipagem de NS</h2>
         <p>Envie o PDF do pedido para extrair SKU e quantidade. Depois, realize a bipagem dos NS por SKU.</p>
         <form method="post" enctype="multipart/form-data" style="margin-bottom:16px;">
             <?php wp_nonce_field('nsr_pdf_upload', 'nsr_pdf_nonce'); ?>
@@ -5987,6 +6102,8 @@ function nsr_render_admin_page() {
             </script>
         <?php endif; ?>
 
+        </section>
+
         <h2>4) Exportar planilha (migracao)</h2>
         <p>Baixe um <code>.csv</code> com todos os registros no mesmo layout de importacao do plugin (ideal para levar para outra hospedagem).</p>
         <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-bottom:24px;">
@@ -5995,7 +6112,8 @@ function nsr_render_admin_page() {
             <button type="submit" class="button button-secondary">Exportar CSV completo</button>
         </form>
 
-        <h2>5) Teste rapido da consulta (admin)</h2>
+        <section id="nsr-section-admin-search">
+        <h2>2) Teste rapido da consulta (admin)</h2>
         <form method="get" style="display:flex;gap:8px;align-items:center;max-width:760px;flex-wrap:wrap;">
             <input type="hidden" name="page" value="<?php echo esc_attr(NSR_PLUGIN_SLUG); ?>" />
             <select name="nsr_admin_tipo">
@@ -6057,7 +6175,24 @@ function nsr_render_admin_page() {
             </div>
         <?php endif; ?>
 
-        <h2>6) Consulta no site (navegador)</h2>
+        </section>
+
+        <script>
+        (function() {
+            var importSection = document.getElementById('nsr-section-import');
+            var pdfSection = document.getElementById('nsr-section-pdf');
+            var searchSection = document.getElementById('nsr-section-admin-search');
+            if (!importSection || !pdfSection || !searchSection || !importSection.parentNode) {
+                return;
+            }
+
+            var container = importSection.parentNode;
+            container.insertBefore(pdfSection, importSection);
+            container.insertBefore(searchSection, importSection);
+        })();
+        </script>
+
+        <h2>5) Consulta no site (navegador)</h2>
         <p>Crie uma pagina no WordPress e use o shortcode: <code>[ns_rastreio_consulta]</code>.</p>
     </div>
     <?php
