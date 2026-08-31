@@ -2,7 +2,7 @@
 /*
  * Plugin Name: NS Rastreio
  * Description: Importa planilhas Excel/CSV para consultar NS e encontrar numero da NF ou numero do pedido.
- * Version: 1.5.1
+ * Version: 1.5.2
  * Author: Itajaitech
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('NSR_PLUGIN_VERSION', '1.5.1');
+define('NSR_PLUGIN_VERSION', '1.5.2');
 define('NSR_PLUGIN_SLUG', 'ns-rastreio');
 
 /**
@@ -3390,6 +3390,80 @@ function nsr_handle_pdf_scan_workflow_submission() {
     }
     // ----- fim entrada manual -----
 
+    // ----- Reabre uma bipagem que ja foi finalizada e salva na base -----
+    if (isset($_POST['nsr_reopen_saved_scan_submit'])) {
+        if (!current_user_can('manage_options')) {
+            $messages['error'][] = 'Permissao insuficiente para abrir a bipagem salva.';
+        } else {
+            check_admin_referer('nsr_reopen_saved_scan', 'nsr_reopen_saved_scan_nonce');
+            $saved_order = sanitize_text_field(wp_unslash(isset($_POST['nsr_saved_pedido']) ? $_POST['nsr_saved_pedido'] : ''));
+            $saved_invoice = sanitize_text_field(wp_unslash(isset($_POST['nsr_saved_nota_fiscal']) ? $_POST['nsr_saved_nota_fiscal'] : ''));
+            global $wpdb;
+            $saved_rows = $wpdb->get_results(
+                $wpdb->prepare(
+                    'SELECT ns, sku, descricao, quantidade, valor, data_venda, origem_arquivo FROM ' . nsr_get_table_name() . ' WHERE pedido = %s AND nota_fiscal = %s ORDER BY id ASC',
+                    $saved_order,
+                    $saved_invoice
+                ),
+                ARRAY_A
+            );
+            if (empty($saved_rows)) {
+                $messages['error'][] = 'A bipagem salva nao foi encontrada.';
+            } else {
+                $saved_items = array();
+                $saved_date = '';
+                $saved_source = 'bipagem_salva';
+                foreach ($saved_rows as $saved_row) {
+                    $sku = strtoupper(trim((string) $saved_row['sku']));
+                    if ($sku === '') {
+                        $sku = 'SEM-SKU';
+                    }
+                    if (!isset($saved_items[$sku])) {
+                        $saved_items[$sku] = array(
+                            'sku' => $sku,
+                            'descricao' => (string) $saved_row['descricao'],
+                            'quantidade' => max(1, (int) $saved_row['quantidade']),
+                            'valor' => (string) $saved_row['valor'],
+                            'scanned' => array(),
+                        );
+                    }
+                    $saved_items[$sku]['quantidade'] = max($saved_items[$sku]['quantidade'], (int) $saved_row['quantidade']);
+                    $serial = trim((string) $saved_row['ns']);
+                    if ($serial !== '' && !in_array($serial, $saved_items[$sku]['scanned'], true)) {
+                        $saved_items[$sku]['scanned'][] = $serial;
+                    }
+                    if ($saved_date === '' && (string) $saved_row['data_venda'] !== '') {
+                        $saved_date = (string) $saved_row['data_venda'];
+                    }
+                    if ((string) $saved_row['origem_arquivo'] !== '') {
+                        $saved_source = (string) $saved_row['origem_arquivo'];
+                    }
+                }
+                foreach ($saved_items as &$saved_item) {
+                    $saved_item['quantidade'] = max((int) $saved_item['quantidade'], count($saved_item['scanned']));
+                }
+                unset($saved_item);
+                $token = nsr_generate_scan_session_token();
+                $session_data = nsr_recompute_scan_session_flags(array(
+                    'session_token' => $token,
+                    'pedido' => $saved_order,
+                    'nota_fiscal' => $saved_invoice,
+                    'data_venda' => $saved_date,
+                    'origem_arquivo' => $saved_source,
+                    'itens' => $saved_items,
+                    'missing_skus' => array(),
+                ));
+                if (!nsr_save_scan_session($token, $session_data)) {
+                    $messages['error'][] = 'Nao foi possivel reabrir a bipagem salva.';
+                } else {
+                    $active_token = $token;
+                    $messages['success'][] = sprintf('Bipagem do Pedido %s / NF %s reaberta com %d NS.', $saved_order !== '' ? $saved_order : '-', $saved_invoice !== '' ? $saved_invoice : '-', count($saved_rows));
+                }
+            }
+        }
+    }
+    // ----- fim reabertura de bipagem salva -----
+
     $session = nsr_get_scan_session($active_token);
 
     if (!empty($session)) {
@@ -5494,6 +5568,15 @@ function nsr_render_admin_page() {
     $total_records = (int) $wpdb->get_var("SELECT COUNT(1) FROM {$table_name}");
     $total_ns_unicos = (int) $wpdb->get_var("SELECT COUNT(DISTINCT ns_normalizado) FROM {$table_name}");
     $total_products = (int) $wpdb->get_var("SELECT COUNT(1) FROM {$products_table}");
+    $saved_scans = $wpdb->get_results(
+        "SELECT pedido, nota_fiscal, COUNT(*) AS total_ns, COUNT(DISTINCT sku) AS total_itens, MAX(updated_at) AS updated_at
+         FROM {$table_name}
+         WHERE pedido <> '' OR nota_fiscal <> ''
+         GROUP BY pedido, nota_fiscal
+         ORDER BY MAX(updated_at) DESC
+         LIMIT 50",
+        ARRAY_A
+    );
 
     $admin_search_value = isset($_GET['nsr_admin_ns']) ? sanitize_text_field(wp_unslash($_GET['nsr_admin_ns'])) : '';
     $admin_search_type = isset($_GET['nsr_admin_tipo']) ? sanitize_key(wp_unslash($_GET['nsr_admin_tipo'])) : 'ns';
@@ -5586,6 +5669,38 @@ function nsr_render_admin_page() {
         <section id="nsr-section-pdf">
         <h2>1) Leitura de Pedido de Venda (PDF) e Bipagem de NS</h2>
         <p>Envie o PDF do pedido para extrair SKU e quantidade. Depois, realize a bipagem dos NS por SKU.</p>
+
+        <details style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;"<?php echo empty($scan_session) ? ' open' : ''; ?>>
+            <summary style="cursor:pointer;font-weight:600;">Bipagens salvas (<?php echo esc_html((string) count($saved_scans)); ?> mais recentes)</summary>
+            <?php if (!empty($saved_scans)) : ?>
+                <p style="color:#555;">Abra uma bipagem finalizada para consultar, corrigir, continuar ou exportar seus produtos e numeros de serie.</p>
+                <table class="widefat striped" style="margin-top:8px;">
+                    <thead><tr><th>Pedido</th><th>Nota Fiscal</th><th>Produtos</th><th>NS bipados</th><th>Atualizado</th><th>Acao</th></tr></thead>
+                    <tbody>
+                    <?php foreach ($saved_scans as $saved_scan) : ?>
+                        <tr>
+                            <td><?php echo esc_html((string) $saved_scan['pedido']); ?></td>
+                            <td><?php echo esc_html((string) $saved_scan['nota_fiscal']); ?></td>
+                            <td><?php echo esc_html((string) $saved_scan['total_itens']); ?></td>
+                            <td><?php echo esc_html((string) $saved_scan['total_ns']); ?></td>
+                            <td><?php echo esc_html((string) $saved_scan['updated_at']); ?></td>
+                            <td>
+                                <form method="post" style="margin:0;">
+                                    <input type="hidden" name="nsr_saved_pedido" value="<?php echo esc_attr((string) $saved_scan['pedido']); ?>" />
+                                    <input type="hidden" name="nsr_saved_nota_fiscal" value="<?php echo esc_attr((string) $saved_scan['nota_fiscal']); ?>" />
+                                    <?php wp_nonce_field('nsr_reopen_saved_scan', 'nsr_reopen_saved_scan_nonce'); ?>
+                                    <button type="submit" name="nsr_reopen_saved_scan_submit" class="button button-secondary">Abrir bipagem</button>
+                                </form>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php else : ?>
+                <p>Nenhuma bipagem finalizada foi encontrada.</p>
+            <?php endif; ?>
+        </details>
+
         <form method="post" enctype="multipart/form-data" style="margin-bottom:16px;">
             <?php wp_nonce_field('nsr_pdf_upload', 'nsr_pdf_nonce'); ?>
             <input type="file" name="nsr_pdf_file" accept=".pdf,.xml" required />
