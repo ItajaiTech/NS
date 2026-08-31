@@ -2,7 +2,7 @@
 /*
  * Plugin Name: NS Rastreio
  * Description: Importa planilhas Excel/CSV para consultar NS e encontrar numero da NF ou numero do pedido.
- * Version: 1.5.0
+ * Version: 1.5.1
  * Author: Itajaitech
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('NSR_PLUGIN_VERSION', '1.5.0');
+define('NSR_PLUGIN_VERSION', '1.5.1');
 define('NSR_PLUGIN_SLUG', 'ns-rastreio');
 
 /**
@@ -3653,6 +3653,100 @@ function nsr_handle_export_csv() {
 }
 add_action('admin_post_nsr_export_csv', 'nsr_handle_export_csv');
 
+/** Escapa texto para uso nos XMLs internos de um XLSX. */
+function nsr_xlsx_xml_text($value) {
+    $value = preg_replace('/[^\x09\x0A\x0D\x20-\x{D7FF}\x{E000}-\x{FFFD}]/u', '', (string) $value);
+    return htmlspecialchars($value, ENT_XML1 | ENT_QUOTES, 'UTF-8');
+}
+
+/** Gera um XLSX com os produtos e NS da sessao de bipagem escolhida. */
+function nsr_handle_export_scan_xlsx() {
+    if (!current_user_can('manage_options')) {
+        wp_die('Permissao insuficiente para exportar a bipagem.');
+    }
+    check_admin_referer('nsr_export_scan_xlsx', 'nsr_export_scan_nonce');
+
+    $token = sanitize_text_field(wp_unslash(isset($_POST['nsr_scan_session_token']) ? $_POST['nsr_scan_session_token'] : ''));
+    $session = nsr_get_scan_session($token);
+    if (empty($session) || empty($session['itens']) || !is_array($session['itens'])) {
+        wp_die('Sessao de bipagem nao encontrada ou expirada.');
+    }
+    if (!class_exists('ZipArchive')) {
+        wp_die('A extensao ZipArchive do PHP e necessaria para gerar o Excel.');
+    }
+
+    $pedido = sanitize_text_field(wp_unslash(isset($_POST['pedido']) ? $_POST['pedido'] : $session['pedido']));
+    $nota_fiscal = sanitize_text_field(wp_unslash(isset($_POST['nota_fiscal']) ? $_POST['nota_fiscal'] : $session['nota_fiscal']));
+    $rows = array(array('Pedido', 'Nota Fiscal', 'SKU', 'Produto', 'Qtd. do item', 'Numero de serie'));
+    foreach ($session['itens'] as $sku => $item) {
+        $serials = isset($item['scanned']) && is_array($item['scanned']) ? $item['scanned'] : array();
+        foreach ($serials as $serial) {
+            $rows[] = array(
+                $pedido,
+                $nota_fiscal,
+                (string) $sku,
+                isset($item['descricao']) ? (string) $item['descricao'] : '',
+                isset($item['quantidade']) ? (string) $item['quantidade'] : '',
+                (string) $serial,
+            );
+        }
+    }
+    if (count($rows) === 1) {
+        wp_die('Esta sessao ainda nao possui produtos bipados para exportar.');
+    }
+
+    $sheet_rows = '';
+    foreach ($rows as $row_index => $row) {
+        $excel_row = $row_index + 1;
+        $cells = '';
+        foreach ($row as $column_index => $value) {
+            $column = chr(65 + $column_index);
+            $style = $row_index === 0 ? ' s="1"' : '';
+            // Texto preserva zeros a esquerda de pedidos, NFs, SKUs e NS.
+            $cells .= '<c r="' . $column . $excel_row . '" t="inlineStr"' . $style . '><is><t xml:space="preserve">' . nsr_xlsx_xml_text($value) . '</t></is></c>';
+        }
+        $sheet_rows .= '<row r="' . $excel_row . '">' . $cells . '</row>';
+    }
+
+    $last_row = count($rows);
+    $worksheet = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        . '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        . '<dimension ref="A1:F' . $last_row . '"/><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+        . '<cols><col min="1" max="2" width="16" customWidth="1"/><col min="3" max="3" width="18" customWidth="1"/><col min="4" max="4" width="48" customWidth="1"/><col min="5" max="5" width="14" customWidth="1"/><col min="6" max="6" width="24" customWidth="1"/></cols>'
+        . '<sheetData>' . $sheet_rows . '</sheetData><autoFilter ref="A1:F' . $last_row . '"/></worksheet>';
+
+    $temp_file = wp_tempnam('nsr-bipagem.xlsx');
+    if (!$temp_file) {
+        wp_die('Nao foi possivel criar o arquivo temporario da exportacao.');
+    }
+    $zip = new ZipArchive();
+    if ($zip->open($temp_file, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+        @unlink($temp_file);
+        wp_die('Nao foi possivel gerar o arquivo Excel.');
+    }
+    $zip->addFromString('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>');
+    $zip->addFromString('_rels/.rels', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>');
+    $zip->addFromString('xl/workbook.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Produtos bipados" sheetId="1" r:id="rId1"/></sheets></workbook>');
+    $zip->addFromString('xl/_rels/workbook.xml.rels', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>');
+    $zip->addFromString('xl/styles.xml', '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF2271B1"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="49" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="49" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyNumberFormat="1"/></cellXfs></styleSheet>');
+    $zip->addFromString('xl/worksheets/sheet1.xml', $worksheet);
+    $zip->close();
+
+    $reference = $pedido !== '' ? 'pedido-' . $pedido : 'nf-' . $nota_fiscal;
+    $filename = sanitize_file_name('bipagem-' . $reference . '-' . gmdate('Ymd-His') . '.xlsx');
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+    nocache_headers();
+    header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    header('Content-Length: ' . filesize($temp_file));
+    readfile($temp_file);
+    @unlink($temp_file);
+    exit;
+}
+add_action('admin_post_nsr_export_scan_xlsx', 'nsr_handle_export_scan_xlsx');
+
 // ============================================================
 // AJAX: Bipar NS (sem reload de pagina)
 // ============================================================
@@ -5655,6 +5749,14 @@ function nsr_render_admin_page() {
                     <button type="button" class="button" id="nsr-btn-copy-serials" onclick="nsrCopyScannedNs()">
                         Copiar NS bipados
                     </button>
+                    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="display:inline;margin:0;" onsubmit="this.pedido.value=document.getElementById('nsr-inp-pedido').value;this.nota_fiscal.value=document.getElementById('nsr-inp-nf').value;">
+                        <input type="hidden" name="action" value="nsr_export_scan_xlsx" />
+                        <input type="hidden" name="nsr_scan_session_token" value="<?php echo esc_attr($scan_token); ?>" />
+                        <input type="hidden" name="pedido" value="<?php echo esc_attr(isset($scan_session['pedido']) ? $scan_session['pedido'] : ''); ?>" />
+                        <input type="hidden" name="nota_fiscal" value="<?php echo esc_attr(isset($scan_session['nota_fiscal']) ? $scan_session['nota_fiscal'] : ''); ?>" />
+                        <?php wp_nonce_field('nsr_export_scan_xlsx', 'nsr_export_scan_nonce'); ?>
+                        <button type="submit" class="button button-secondary" id="nsr-btn-export-xlsx">Exportar bipagem em Excel</button>
+                    </form>
                     <button type="button" class="button button-primary" id="nsr-btn-finalize" onclick="nsrFinalize()">
                         Finalizar e salvar NS
                     </button>
