@@ -3452,6 +3452,7 @@ function nsr_handle_pdf_scan_workflow_submission() {
                     'origem_arquivo' => $saved_source,
                     'itens' => $saved_items,
                     'missing_skus' => array(),
+                    'reopened_from' => array('pedido' => $saved_order, 'nota_fiscal' => $saved_invoice),
                 ));
                 if (!nsr_save_scan_session($token, $session_data)) {
                     $messages['error'][] = 'Nao foi possivel reabrir a bipagem salva.';
@@ -3570,6 +3571,17 @@ function nsr_handle_pdf_scan_workflow_submission() {
                 $wpdb->query('START TRANSACTION');
                 $saved = 0;
                 $failed = false;
+                if (!empty($session['reopened_from']) && is_array($session['reopened_from'])) {
+                    $deleted = $wpdb->delete(
+                        nsr_get_table_name(),
+                        array(
+                            'pedido' => (string) ($session['reopened_from']['pedido'] ?? ''),
+                            'nota_fiscal' => (string) ($session['reopened_from']['nota_fiscal'] ?? ''),
+                        ),
+                        array('%s', '%s')
+                    );
+                    $failed = ($deleted === false);
+                }
 
                 foreach ($session['itens'] as $sku => $item) {
                     $descricao   = isset($item['descricao']) ? (string) $item['descricao'] : '';
@@ -5417,6 +5429,17 @@ function nsr_ajax_finalize_session() {
     $wpdb->query('START TRANSACTION');
     $saved  = 0;
     $failed = false;
+    if (!empty($session['reopened_from']) && is_array($session['reopened_from'])) {
+        $deleted = $wpdb->delete(
+            nsr_get_table_name(),
+            array(
+                'pedido' => (string) ($session['reopened_from']['pedido'] ?? ''),
+                'nota_fiscal' => (string) ($session['reopened_from']['nota_fiscal'] ?? ''),
+            ),
+            array('%s', '%s')
+        );
+        $failed = ($deleted === false);
+    }
 
     foreach ($session['itens'] as $sku => $item) {
         $descricao    = isset($item['descricao']) ? (string) $item['descricao'] : '';
