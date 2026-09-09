@@ -6,7 +6,9 @@ Na sessao de bipagem ativa, o botao **Exportar bipagem em Excel** gera um arquiv
 
 A lista **Bipagens salvas** permite buscar pelo pedido ou nota fiscal (numero completo ou parte) e navegar por todas as bipagens salvas, em paginas de 50 registros. Use **Abrir bipagem** no resultado desejado para consultar ou alterar, inclusive registros antigos.
 
-Versao atual: `1.5.3`
+O painel administrativo esta organizado nas abas **Bipagem**, **Consultar NS**, **Produtos**, **Importar / Exportar** e **Integracao Tiny**. A troca de abas preserva a sessao de bipagem aberta na pagina.
+
+Versao atual: `1.5.4`
 
 ## Requisitos
 

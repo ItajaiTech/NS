@@ -2,7 +2,7 @@
 /*
  * Plugin Name: NS Rastreio
  * Description: Importa planilhas Excel/CSV para consultar NS e encontrar numero da NF ou numero do pedido.
- * Version: 1.5.3
+ * Version: 1.5.4
  * Author: Itajaitech
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('NSR_PLUGIN_VERSION', '1.5.3');
+define('NSR_PLUGIN_VERSION', '1.5.4');
 define('NSR_PLUGIN_SLUG', 'ns-rastreio');
 
 /**
@@ -5626,6 +5626,23 @@ function nsr_render_admin_page() {
         'nf' => 'NF',
         'pedido' => 'Pedido',
     );
+    $panel_tabs = array(
+        'bipagem' => 'Bipagem',
+        'consulta' => 'Consultar NS',
+        'produtos' => 'Produtos',
+        'arquivos' => 'Importar / Exportar',
+        'tiny' => 'Integracao Tiny',
+    );
+    $active_tab = isset($_POST['nsr_tab']) ? sanitize_key(wp_unslash($_POST['nsr_tab'])) : (isset($_GET['nsr_tab']) ? sanitize_key(wp_unslash($_GET['nsr_tab'])) : 'bipagem');
+    if (!isset($panel_tabs[$active_tab])) {
+        $active_tab = 'bipagem';
+    }
+    if (isset($_GET['nsr_admin_ns'])) {
+        $active_tab = 'consulta';
+    }
+    if (!empty($scan_session) || isset($_GET['nsr_saved_search']) || isset($_GET['nsr_saved_page'])) {
+        $active_tab = 'bipagem';
+    }
     $admin_search_label = $admin_search_label_map[$admin_search_type];
     $admin_is_partial = (isset($_GET['nsr_admin_partial']) && $_GET['nsr_admin_partial'] === '1');
     $admin_results = array();
@@ -5633,7 +5650,7 @@ function nsr_render_admin_page() {
         $admin_results = nsr_find_admin_records($admin_search_value, $admin_search_type, $admin_is_partial, 200);
     }
     ?>
-    <div class="wrap">
+    <div class="wrap nsr-admin">
         <h1>NS Rastreio</h1>
         <?php settings_errors('nsr_messages'); ?>
 
@@ -5643,8 +5660,22 @@ function nsr_render_admin_page() {
             | <strong>Produtos cadastrados:</strong> <?php echo esc_html((string) $total_products); ?>
         </p>
 
-        <section id="nsr-section-import">
-        <h2>3) Importar planilhas</h2>
+        <style>
+            .nsr-admin .nsr-navigation { display:flex; flex-wrap:wrap; gap:6px; margin:20px 0; border-bottom:1px solid #c3c4c7; padding-bottom:0; }
+            .nsr-admin .nsr-navigation .nav-tab { margin:0; padding:10px 16px; }
+            .nsr-admin .nsr-panel { background:#fff; border:1px solid #dcdcde; border-radius:8px; padding:20px; margin:0 0 20px; overflow-x:auto; }
+            .nsr-admin .nsr-panel[hidden] { display:none; }
+            .nsr-admin .nsr-panel > h2:first-child { margin-top:0; }
+            .nsr-admin input, .nsr-admin textarea { max-width:100%; }
+            @media (max-width:782px) { .nsr-admin .nsr-panel { padding:12px; } .nsr-admin .nsr-navigation .nav-tab { padding:8px 10px; } }
+        </style>
+        <nav class="nsr-navigation" aria-label="Opcoes do NS Rastreio">
+            <?php foreach ($panel_tabs as $tab_key => $tab_label) : ?>
+                <a class="nav-tab<?php echo $active_tab === $tab_key ? ' nav-tab-active' : ''; ?>" data-nsr-tab="<?php echo esc_attr($tab_key); ?>" href="<?php echo esc_url(add_query_arg(array('page' => NSR_PLUGIN_SLUG, 'nsr_tab' => $tab_key), admin_url('admin.php'))); ?>"<?php echo $active_tab === $tab_key ? ' aria-current="page"' : ''; ?>><?php echo esc_html($tab_label); ?></a>
+            <?php endforeach; ?>
+        </nav>
+        <section id="nsr-section-import" class="nsr-panel" data-nsr-panel="arquivos"<?php echo $active_tab !== 'arquivos' ? ' hidden' : ''; ?>>
+        <h2>Importar planilhas de NS</h2>
         <p>Envie arquivos <code>.xlsx</code> ou <code>.csv</code> com cabecalho. Colunas obrigatorias: <code>Observacoes internas</code> (NS), <code>Numero (Nota Fiscal)</code> e <code>Numero</code> (Pedido).</p>
         <p>Colunas opcionais: <code>Codigo (SKU)</code>, <code>Descricao do produto</code>, <code>Quantidade de produtos</code>, <code>Valor total da venda</code>, <code>Data da venda</code>.</p>
 
@@ -5656,7 +5687,10 @@ function nsr_render_admin_page() {
             </p>
         </form>
 
-        <h2>3.1) Importar base de produtos (SKU x Descricao)</h2>
+        </section>
+
+        <section id="nsr-section-products" class="nsr-panel" data-nsr-panel="produtos"<?php echo $active_tab !== 'produtos' ? ' hidden' : ''; ?>>
+        <h2>Importar base de produtos</h2>
         <p>Envie arquivo <code>.xlsx</code> ou <code>.csv</code> com colunas de SKU e descricao para validar o pedido do PDF.</p>
         <form method="post" enctype="multipart/form-data" style="margin-bottom:24px;">
             <?php wp_nonce_field('nsr_products_import', 'nsr_products_nonce'); ?>
@@ -5666,7 +5700,7 @@ function nsr_render_admin_page() {
             </p>
         </form>
 
-        <h3>3.2) Cadastro manual rapido de produto</h3>
+        <h3>Cadastrar produto manualmente</h3>
         <p>Use este formulario quando chegar SKU novo no pedido (ex.: PRD000XX) e ele ainda nao estiver na base.</p>
         <form method="post" style="margin-bottom:24px;display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;">
             <?php wp_nonce_field('nsr_product_manual', 'nsr_product_manual_nonce'); ?>
@@ -5681,7 +5715,10 @@ function nsr_render_admin_page() {
             <button type="submit" name="nsr_product_manual_submit" class="button button-primary">Salvar produto</button>
         </form>
 
-        <h3>3.3) Integracao Tiny (tokens por sistema)</h3>
+        </section>
+
+        <section id="nsr-section-tiny" class="nsr-panel" data-nsr-panel="tiny"<?php echo $active_tab !== 'tiny' ? ' hidden' : ''; ?>>
+        <h2>Integracao Tiny</h2>
         <p>Configure um token para cada sistema Tiny: KDT, TEKE e TECH. O envio de NS sera feito manualmente e separado por sistema.</p>
         <form method="post" style="margin-bottom:24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;max-width:820px;">
             <?php wp_nonce_field('nsr_tiny_tokens', 'nsr_tiny_tokens_nonce'); ?>
@@ -5704,8 +5741,8 @@ function nsr_render_admin_page() {
 
         </section>
 
-        <section id="nsr-section-pdf">
-        <h2>1) Leitura de Pedido de Venda (PDF) e Bipagem de NS</h2>
+        <section id="nsr-section-pdf" class="nsr-panel" data-nsr-panel="bipagem"<?php echo $active_tab !== 'bipagem' ? ' hidden' : ''; ?>>
+        <h2>Bipagem de numeros de serie</h2>
         <p>Envie o PDF do pedido para extrair SKU e quantidade. Depois, realize a bipagem dos NS por SKU.</p>
 
         <details style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;"<?php echo empty($scan_session) ? ' open' : ''; ?>>
@@ -5764,7 +5801,7 @@ function nsr_render_admin_page() {
         </form>
         <p style="margin-top:-10px;color:#666;font-size:12px;">Aceita PDF do pedido de venda ou XML da NF-e (NF-e 4.0).</p>
 
-        <details style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;" open>
+        <details style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;">
             <summary style="cursor:pointer;font-weight:600;">Inserir itens manualmente (use quando o PDF e imagem/scan)</summary>
             <p style="margin-top:8px;color:#555;">Digite um item por linha no formato: <code>SKU;QUANTIDADE</code><br>
             Separadores aceitos: <code>;</code> <code>|</code> <code>,</code> ou TAB. Linhas com <code>#</code> sao ignoradas.</p>
@@ -6377,7 +6414,8 @@ function nsr_render_admin_page() {
 
         </section>
 
-        <h2>4) Exportar planilha (migracao)</h2>
+        <section id="nsr-section-export" class="nsr-panel" data-nsr-panel="arquivos"<?php echo $active_tab !== 'arquivos' ? ' hidden' : ''; ?>>
+        <h2>Exportar planilha</h2>
         <p>Baixe um <code>.csv</code> com todos os registros no mesmo layout de importacao do plugin (ideal para levar para outra hospedagem).</p>
         <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-bottom:24px;">
             <input type="hidden" name="action" value="nsr_export_csv" />
@@ -6385,8 +6423,10 @@ function nsr_render_admin_page() {
             <button type="submit" class="button button-secondary">Exportar CSV completo</button>
         </form>
 
-        <section id="nsr-section-admin-search">
-        <h2>2) Teste rapido da consulta (admin)</h2>
+        </section>
+
+        <section id="nsr-section-admin-search" class="nsr-panel" data-nsr-panel="consulta"<?php echo $active_tab !== 'consulta' ? ' hidden' : ''; ?>>
+        <h2>Consultar numeros de serie</h2>
         <form method="get" style="display:flex;gap:8px;align-items:center;max-width:760px;flex-wrap:wrap;">
             <input type="hidden" name="page" value="<?php echo esc_attr(NSR_PLUGIN_SLUG); ?>" />
             <select name="nsr_admin_tipo">
@@ -6448,25 +6488,48 @@ function nsr_render_admin_page() {
             </div>
         <?php endif; ?>
 
+        <hr style="margin:24px 0;" />
+        <h3>Consulta no site</h3>
+        <p>Para disponibilizar a consulta no site, crie uma pagina no WordPress com o shortcode <code>[ns_rastreio_consulta]</code>.</p>
         </section>
 
         <script>
         (function() {
-            var importSection = document.getElementById('nsr-section-import');
-            var pdfSection = document.getElementById('nsr-section-pdf');
-            var searchSection = document.getElementById('nsr-section-admin-search');
-            if (!importSection || !pdfSection || !searchSection || !importSection.parentNode) {
-                return;
-            }
-
-            var container = importSection.parentNode;
-            container.insertBefore(pdfSection, importSection);
-            container.insertBefore(searchSection, importSection);
+            var root = document.querySelector('.nsr-admin');
+            var links = root.querySelectorAll('[data-nsr-tab]');
+            var panels = root.querySelectorAll('[data-nsr-panel]');
+            // Keep the selected area after a form submission, including validation errors.
+            panels.forEach(function(panel) {
+                panel.querySelectorAll('form').forEach(function(form) {
+                    var input = document.createElement('input');
+                    input.type = 'hidden';
+                    input.name = 'nsr_tab';
+                    input.value = panel.dataset.nsrPanel;
+                    form.appendChild(input);
+                });
+            });
+            links.forEach(function(link) {
+                link.addEventListener('click', function(event) {
+                    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+                    event.preventDefault();
+                    var tab = link.dataset.nsrTab;
+                    panels.forEach(function(panel) { panel.hidden = panel.dataset.nsrPanel !== tab; });
+                    links.forEach(function(item) {
+                        var active = item === link;
+                        item.classList.toggle('nav-tab-active', active);
+                        if (active) item.setAttribute('aria-current', 'page');
+                        else item.removeAttribute('aria-current');
+                    });
+                    // Switching areas preserves the current scanning session in the page.
+                    var url = new URL(window.location.href);
+                    url.searchParams.set('nsr_tab', tab);
+                    ['nsr_admin_ns', 'nsr_saved_search', 'nsr_saved_page'].forEach(function(key) { url.searchParams.delete(key); });
+                    url.hash = '';
+                    window.history.replaceState(null, '', url);
+                });
+            });
         })();
         </script>
-
-        <h2>5) Consulta no site (navegador)</h2>
-        <p>Crie uma pagina no WordPress e use o shortcode: <code>[ns_rastreio_consulta]</code>.</p>
     </div>
     <?php
 }
