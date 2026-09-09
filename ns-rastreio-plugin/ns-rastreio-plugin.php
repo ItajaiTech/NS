@@ -2,7 +2,7 @@
 /*
  * Plugin Name: NS Rastreio
  * Description: Importa planilhas Excel/CSV para consultar NS e encontrar numero da NF ou numero do pedido.
- * Version: 1.5.2
+ * Version: 1.5.3
  * Author: Itajaitech
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('NSR_PLUGIN_VERSION', '1.5.2');
+define('NSR_PLUGIN_VERSION', '1.5.3');
 define('NSR_PLUGIN_SLUG', 'ns-rastreio');
 
 /**
@@ -5591,13 +5591,28 @@ function nsr_render_admin_page() {
     $total_records = (int) $wpdb->get_var("SELECT COUNT(1) FROM {$table_name}");
     $total_ns_unicos = (int) $wpdb->get_var("SELECT COUNT(DISTINCT ns_normalizado) FROM {$table_name}");
     $total_products = (int) $wpdb->get_var("SELECT COUNT(1) FROM {$products_table}");
+    $saved_search = isset($_GET['nsr_saved_search']) ? sanitize_text_field(wp_unslash($_GET['nsr_saved_search'])) : '';
+    $saved_page = max(1, isset($_GET['nsr_saved_page']) ? absint($_GET['nsr_saved_page']) : 1);
+    $saved_per_page = 50;
+    $saved_where = "(pedido <> '' OR nota_fiscal <> '')";
+    if ($saved_search !== '') {
+        $saved_like = '%' . $wpdb->esc_like($saved_search) . '%';
+        $saved_where .= $wpdb->prepare(' AND (pedido LIKE %s OR nota_fiscal LIKE %s)', $saved_like, $saved_like);
+    }
+    $saved_total = (int) $wpdb->get_var(
+        "SELECT COUNT(*) FROM (SELECT pedido, nota_fiscal FROM {$table_name} WHERE {$saved_where} GROUP BY pedido, nota_fiscal) AS saved_groups"
+    );
+    $saved_pages = max(1, (int) ceil($saved_total / $saved_per_page));
+    $saved_page = min($saved_page, $saved_pages);
+    $saved_offset = ($saved_page - 1) * $saved_per_page;
+    $saved_base_url = add_query_arg(array('page' => NSR_PLUGIN_SLUG, 'nsr_saved_search' => $saved_search), admin_url('admin.php'));
     $saved_scans = $wpdb->get_results(
         "SELECT pedido, nota_fiscal, COUNT(*) AS total_ns, COUNT(DISTINCT sku) AS total_itens, MAX(updated_at) AS updated_at
          FROM {$table_name}
-         WHERE pedido <> '' OR nota_fiscal <> ''
+         WHERE {$saved_where}
          GROUP BY pedido, nota_fiscal
-         ORDER BY MAX(updated_at) DESC
-         LIMIT 50",
+         ORDER BY MAX(updated_at) DESC, pedido ASC, nota_fiscal ASC
+         LIMIT {$saved_per_page} OFFSET {$saved_offset}",
         ARRAY_A
     );
 
@@ -5694,7 +5709,14 @@ function nsr_render_admin_page() {
         <p>Envie o PDF do pedido para extrair SKU e quantidade. Depois, realize a bipagem dos NS por SKU.</p>
 
         <details style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;"<?php echo empty($scan_session) ? ' open' : ''; ?>>
-            <summary style="cursor:pointer;font-weight:600;">Bipagens salvas (<?php echo esc_html((string) count($saved_scans)); ?> mais recentes)</summary>
+            <summary style="cursor:pointer;font-weight:600;">Bipagens salvas (<?php echo esc_html((string) $saved_total); ?> encontradas)</summary>
+            <form method="get" action="<?php echo esc_url(admin_url('admin.php')); ?>#nsr-section-pdf" style="margin-top:12px;">
+                <input type="hidden" name="page" value="<?php echo esc_attr(NSR_PLUGIN_SLUG); ?>" />
+                <label for="nsr-saved-search">Pedido ou nota fiscal</label>
+                <input type="search" id="nsr-saved-search" name="nsr_saved_search" value="<?php echo esc_attr($saved_search); ?>" placeholder="Digite o numero completo ou parte" />
+                <button type="submit" class="button">Buscar bipagem</button>
+                <a class="button" href="<?php echo esc_url(admin_url('admin.php?page=' . NSR_PLUGIN_SLUG) . '#nsr-section-pdf'); ?>">Limpar busca</a>
+            </form>
             <?php if (!empty($saved_scans)) : ?>
                 <p style="color:#555;">Abra uma bipagem finalizada para consultar, corrigir, continuar ou exportar seus produtos e numeros de serie.</p>
                 <table class="widefat striped" style="margin-top:8px;">
@@ -5720,7 +5742,18 @@ function nsr_render_admin_page() {
                     </tbody>
                 </table>
             <?php else : ?>
-                <p>Nenhuma bipagem finalizada foi encontrada.</p>
+                <p>Nenhuma bipagem finalizada foi encontrada<?php echo $saved_search !== '' ? ' para esta busca' : ''; ?>.</p>
+            <?php endif; ?>
+            <?php if ($saved_pages > 1) : ?>
+                <nav aria-label="Paginas de bipagens salvas" style="margin-top:12px;display:flex;gap:12px;align-items:center;">
+                    <?php if ($saved_page > 1) : ?>
+                        <a class="button" href="<?php echo esc_url(add_query_arg('nsr_saved_page', $saved_page - 1, $saved_base_url) . '#nsr-section-pdf'); ?>">Anterior</a>
+                    <?php endif; ?>
+                    <span><?php echo esc_html(sprintf('Pagina %d de %d — %d bipagens', $saved_page, $saved_pages, $saved_total)); ?></span>
+                    <?php if ($saved_page < $saved_pages) : ?>
+                        <a class="button" href="<?php echo esc_url(add_query_arg('nsr_saved_page', $saved_page + 1, $saved_base_url) . '#nsr-section-pdf'); ?>">Proxima</a>
+                    <?php endif; ?>
+                </nav>
             <?php endif; ?>
         </details>
 

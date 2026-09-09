@@ -4,7 +4,9 @@ Plugin para importar planilhas Excel/CSV e consultar numero de serie (NS) no nav
 
 Na sessao de bipagem ativa, o botao **Exportar bipagem em Excel** gera um arquivo `.xlsx` somente daquela sessao. A planilha traz Pedido, Nota Fiscal, SKU, Produto, quantidade do item e uma linha para cada numero de serie bipado. A lista **Bipagens salvas** permite reabrir uma bipagem finalizada para consultar, corrigir, continuar ou exportar novamente.
 
-Versao atual: `1.5.0`
+A lista **Bipagens salvas** permite buscar pelo pedido ou nota fiscal (numero completo ou parte) e navegar por todas as bipagens salvas, em paginas de 50 registros. Use **Abrir bipagem** no resultado desejado para consultar ou alterar, inclusive registros antigos.
+
+Versao atual: `1.5.3`
 
 ## Requisitos
 
