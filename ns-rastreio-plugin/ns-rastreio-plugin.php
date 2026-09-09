@@ -2497,15 +2497,48 @@ function nsr_cleanup_old_scan_sessions() {
  * @param array $session
  * @return array
  */
+function nsr_edit_scan_item($session, $action, $sku, $qty, $description = '') {
+    if ($sku === '') {
+        return new WP_Error('empty_sku', 'Informe o SKU.');
+    }
+    $exists = isset($session['itens'][$sku]);
+    if ($action === 'add' || $action === 'quantity') {
+        if (!ctype_digit((string) $qty) || (int) $qty < 1 || (int) $qty > 50000) {
+            return new WP_Error('invalid_quantity', 'Informe uma quantidade inteira entre 1 e 50000.');
+        }
+        if ($action === 'add') {
+            if ($exists) {
+                return new WP_Error('duplicate_sku', 'Este SKU ja esta na sessao. Altere a quantidade na linha do item.');
+            }
+            $session['itens'][$sku] = array('sku' => $sku, 'descricao' => $description, 'quantidade' => (int) $qty, 'valor' => '', 'scanned' => array());
+        } else {
+            if (!$exists) {
+                return new WP_Error('missing_sku', 'SKU nao encontrado na sessao.');
+            }
+            if ((int) $qty < count($session['itens'][$sku]['scanned'] ?? array())) {
+                return new WP_Error('scanned_quantity', 'Remova os NS excedentes antes de reduzir a quantidade.');
+            }
+            $session['itens'][$sku]['quantidade'] = (int) $qty;
+        }
+    } elseif ($action === 'remove' || $action === 'reset') {
+        if (!$exists) {
+            return new WP_Error('missing_sku', 'SKU nao encontrado na sessao.');
+        }
+        if ($action === 'remove') {
+            unset($session['itens'][$sku]);
+        } else {
+            $session['itens'][$sku]['scanned'] = array();
+        }
+    } else {
+        return new WP_Error('invalid_action', 'Acao invalida.');
+    }
+    return nsr_recompute_scan_session_flags($session);
+}
+
 function nsr_recompute_scan_session_flags($session) {
     $itens = isset($session['itens']) && is_array($session['itens']) ? $session['itens'] : array();
 
-    // Defesa final: nunca manter SKU fora do padrao PRD+numeros na sessao.
-    foreach (array_keys($itens) as $sku_key) {
-        if (!nsr_is_probable_sku((string) $sku_key)) {
-            unset($itens[$sku_key]);
-        }
-    }
+    // A sessao pode conter SKUs manuais ou salvos fora do padrao do parser de PDF.
 
     $session['itens'] = $itens;
     $skus = array_keys($itens);
@@ -3484,6 +3517,22 @@ function nsr_handle_pdf_scan_workflow_submission() {
             $session['nota_fiscal'] = sanitize_text_field(wp_unslash($_POST['nsr_nota_fiscal']));
         }
 
+        if (isset($_POST['nsr_edit_item'])) {
+            check_admin_referer('nsr_scan_action', 'nsr_scan_nonce');
+            $edited = nsr_edit_scan_item($session, sanitize_key(wp_unslash($_POST['nsr_edit_item'])),
+                strtoupper(sanitize_text_field(wp_unslash($_POST['nsr_item_sku'] ?? ''))),
+                sanitize_text_field(wp_unslash($_POST['nsr_item_qty'] ?? '')),
+                sanitize_text_field(wp_unslash($_POST['nsr_item_description'] ?? '')));
+            if (is_wp_error($edited)) {
+                $messages['error'][] = $edited->get_error_message();
+            } elseif (!nsr_save_scan_session($active_token, $edited)) {
+                $messages['error'][] = 'Nao foi possivel salvar a alteracao do item.';
+            } else {
+                $session = $edited;
+                $messages['success'][] = 'Item atualizado na sessao. Ao terminar, clique em Finalizar e salvar NS para atualizar a base.';
+            }
+        }
+
         if (isset($_POST['nsr_scan_add_submit'])) {
             check_admin_referer('nsr_scan_action', 'nsr_scan_nonce');
 
@@ -3557,6 +3606,9 @@ function nsr_handle_pdf_scan_workflow_submission() {
             }
 
             $has_qty_error = false;
+            if (empty($session['itens'])) {
+                $messages['error'][] = 'Adicione ao menos um SKU antes de finalizar.';
+            }
             foreach ($session['itens'] as $sku => $item) {
                 $expected = (int) $item['quantidade'];
                 $scanned = isset($item['scanned']) && is_array($item['scanned']) ? count($item['scanned']) : 0;
@@ -5417,6 +5469,10 @@ function nsr_ajax_finalize_session() {
     $session = nsr_recompute_scan_session_flags($session);
     $missing_skus = !empty($session['missing_skus']) && is_array($session['missing_skus']) ? $session['missing_skus'] : array();
 
+    if (empty($session['itens'])) {
+        wp_send_json_error(array('msg' => 'Adicione ao menos um SKU antes de finalizar.'), 400);
+    }
+
     foreach ($session['itens'] as $sku => $item) {
         $expected = (int) $item['quantidade'];
         $scanned  = isset($item['scanned']) && is_array($item['scanned']) ? count($item['scanned']) : 0;
@@ -5562,6 +5618,35 @@ function nsr_ajax_cancel_session() {
 }
 add_action('wp_ajax_nsr_cancel_session', 'nsr_ajax_cancel_session');
 
+/** Exclui os registros da bipagem salva identificada por pedido e nota fiscal. */
+function nsr_handle_delete_saved_scan() {
+    $messages = array('success' => array(), 'error' => array());
+    if (!isset($_POST['nsr_delete_saved_scan_submit'])) {
+        return $messages;
+    }
+    if (!current_user_can('manage_options')) {
+        $messages['error'][] = 'Permissao insuficiente para excluir a bipagem.';
+        return $messages;
+    }
+    check_admin_referer('nsr_delete_saved_scan', 'nsr_delete_saved_scan_nonce');
+    $pedido = sanitize_text_field(wp_unslash(isset($_POST['nsr_saved_pedido']) ? $_POST['nsr_saved_pedido'] : ''));
+    $nota = sanitize_text_field(wp_unslash(isset($_POST['nsr_saved_nota_fiscal']) ? $_POST['nsr_saved_nota_fiscal'] : ''));
+    if (($pedido === '' && $nota === '') || !isset($_POST['nsr_delete_confirmed']) || $_POST['nsr_delete_confirmed'] !== '1') {
+        $messages['error'][] = 'Confirme a exclusao de uma bipagem com pedido ou nota fiscal.';
+        return $messages;
+    }
+    global $wpdb;
+    $deleted = $wpdb->delete(nsr_get_table_name(), array('pedido' => $pedido, 'nota_fiscal' => $nota), array('%s', '%s'));
+    if ($deleted === false) {
+        $messages['error'][] = 'Nao foi possivel excluir a bipagem. Tente novamente.';
+    } elseif ($deleted === 0) {
+        $messages['error'][] = 'A bipagem nao foi encontrada ou ja foi excluida.';
+    } else {
+        $messages['success'][] = sprintf('Bipagem excluida: pedido %s / nota fiscal %s. %d registro(s) de NS removido(s).', $pedido !== '' ? $pedido : 'nao informado', $nota !== '' ? $nota : 'nao informada', $deleted);
+    }
+    return $messages;
+}
+
 function nsr_render_admin_page() {
     global $wpdb;
 
@@ -5569,6 +5654,7 @@ function nsr_render_admin_page() {
         'success' => array(),
         'error' => array(),
     );
+    $messages = nsr_merge_messages($messages, nsr_handle_delete_saved_scan());
     $messages = nsr_merge_messages($messages, nsr_handle_import_submission());
     $messages = nsr_merge_messages($messages, nsr_handle_products_import_submission());
     $messages = nsr_merge_messages($messages, nsr_handle_product_manual_submission());
@@ -5745,7 +5831,7 @@ function nsr_render_admin_page() {
         <h2>Bipagem de numeros de serie</h2>
         <p>Envie o PDF do pedido para extrair SKU e quantidade. Depois, realize a bipagem dos NS por SKU.</p>
 
-        <details style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;"<?php echo empty($scan_session) ? ' open' : ''; ?>>
+        <details style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;"<?php echo isset($_GET['nsr_saved_search']) || isset($_GET['nsr_saved_page']) || isset($_POST['nsr_delete_saved_scan_submit']) ? ' open' : ''; ?>>
             <summary style="cursor:pointer;font-weight:600;">Bipagens salvas (<?php echo esc_html((string) $saved_total); ?> encontradas)</summary>
             <form method="get" action="<?php echo esc_url(admin_url('admin.php')); ?>#nsr-section-pdf" style="margin-top:12px;">
                 <input type="hidden" name="page" value="<?php echo esc_attr(NSR_PLUGIN_SLUG); ?>" />
@@ -5772,6 +5858,13 @@ function nsr_render_admin_page() {
                                     <input type="hidden" name="nsr_saved_nota_fiscal" value="<?php echo esc_attr((string) $saved_scan['nota_fiscal']); ?>" />
                                     <?php wp_nonce_field('nsr_reopen_saved_scan', 'nsr_reopen_saved_scan_nonce'); ?>
                                     <button type="submit" name="nsr_reopen_saved_scan_submit" class="button button-secondary">Abrir bipagem</button>
+                                </form>
+                                <form method="post" class="nsr-delete-saved-scan" style="margin-top:6px;" data-confirm="<?php echo esc_attr(sprintf('Voce tem certeza que deseja excluir a sessao de bipagem do pedido %s / nota fiscal %s? Todos os NS desta bipagem serao removidos da base local. Esta acao nao pode ser desfeita.', $saved_scan['pedido'] !== '' ? $saved_scan['pedido'] : 'nao informado', $saved_scan['nota_fiscal'] !== '' ? $saved_scan['nota_fiscal'] : 'nao informada')); ?>">
+                                    <input type="hidden" name="nsr_saved_pedido" value="<?php echo esc_attr((string) $saved_scan['pedido']); ?>" />
+                                    <input type="hidden" name="nsr_saved_nota_fiscal" value="<?php echo esc_attr((string) $saved_scan['nota_fiscal']); ?>" />
+                                    <input type="hidden" name="nsr_delete_confirmed" value="0" />
+                                    <?php wp_nonce_field('nsr_delete_saved_scan', 'nsr_delete_saved_scan_nonce'); ?>
+                                    <button type="submit" name="nsr_delete_saved_scan_submit" class="button" style="color:#b32d2e;border-color:#b32d2e;" disabled>Excluir bipagem</button>
                                 </form>
                             </td>
                         </tr>
@@ -5801,7 +5894,7 @@ function nsr_render_admin_page() {
         </form>
         <p style="margin-top:-10px;color:#666;font-size:12px;">Aceita PDF do pedido de venda ou XML da NF-e (NF-e 4.0).</p>
 
-        <details style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;">
+        <details style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;" open>
             <summary style="cursor:pointer;font-weight:600;">Inserir itens manualmente (use quando o PDF e imagem/scan)</summary>
             <p style="margin-top:8px;color:#555;">Digite um item por linha no formato: <code>SKU;QUANTIDADE</code><br>
             Separadores aceitos: <code>;</code> <code>|</code> <code>,</code> ou TAB. Linhas com <code>#</code> sao ignoradas.</p>
@@ -5841,6 +5934,15 @@ function nsr_render_admin_page() {
                 <?php endif; ?>
 
                 <!-- Tabela de SKUs clicavel -->
+                <p>Edite os itens abaixo. Para substituir um NS, clique no numero com &times; e bipe novamente. Use <strong>Rebipar SKU</strong> para limpar todos os NS do item. As alteracoes entram na base ao clicar em <strong>Finalizar e salvar NS</strong>.</p>
+                <form method="post" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:16px;">
+                    <input type="hidden" name="nsr_scan_session_token" value="<?php echo esc_attr($scan_token); ?>" />
+                    <?php wp_nonce_field('nsr_scan_action', 'nsr_scan_nonce'); ?>
+                    <label>SKU<br><input name="nsr_item_sku" required /></label>
+                    <label>Descricao<br><input name="nsr_item_description" /></label>
+                    <label>Quantidade<br><input type="number" name="nsr_item_qty" min="1" max="50000" value="1" required style="width:90px;" /></label>
+                    <button class="button" name="nsr_edit_item" value="add">Adicionar SKU</button>
+                </form>
                 <table class="widefat" id="nsr-sku-table" style="margin-bottom:14px;cursor:pointer;">
                     <thead>
                         <tr>
@@ -5851,6 +5953,7 @@ function nsr_render_admin_page() {
                             <th>Qtd Bipado</th>
                             <th>Status</th>
                             <th>NS bipados</th>
+                            <th>Editar item</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -5893,6 +5996,17 @@ function nsr_render_admin_page() {
                                             <?php echo esc_html($sn); ?> &times;
                                         </button>
                                     <?php endforeach; ?>
+                                </td>
+                                <td onclick="event.stopPropagation();">
+                                    <form method="post" onsubmit="var a=event.submitter ? event.submitter.value : 'quantity'; return a === 'quantity' || confirm(a === 'remove' ? 'Tem certeza que deseja excluir este SKU e seus NS da sessao?' : 'Tem certeza que deseja limpar os NS deste SKU para bipar novamente?');">
+                                        <input type="hidden" name="nsr_scan_session_token" value="<?php echo esc_attr($scan_token); ?>" />
+                                        <input type="hidden" name="nsr_item_sku" value="<?php echo esc_attr($sku); ?>" />
+                                        <?php wp_nonce_field('nsr_scan_action', 'nsr_scan_nonce'); ?>
+                                        <input aria-label="Quantidade do SKU <?php echo esc_attr($sku); ?>" type="number" name="nsr_item_qty" min="1" max="50000" value="<?php echo esc_attr((string) $expected); ?>" required style="width:80px;" />
+                                        <button class="button button-small" name="nsr_edit_item" value="quantity">Alterar quantidade</button>
+                                        <button class="button button-small" name="nsr_edit_item" value="reset" formnovalidate>Rebipar SKU</button>
+                                        <button class="button button-small" name="nsr_edit_item" value="remove" formnovalidate style="color:#b32d2e;">Excluir SKU</button>
+                                    </form>
                                 </td>
                             </tr>
                         <?php endforeach; ?>
@@ -6496,6 +6610,14 @@ function nsr_render_admin_page() {
         <script>
         (function() {
             var root = document.querySelector('.nsr-admin');
+            root.querySelectorAll('.nsr-delete-saved-scan').forEach(function(form) {
+                form.addEventListener('submit', function(event) {
+                    var confirmed = window.confirm(form.dataset.confirm);
+                    form.elements.nsr_delete_confirmed.value = confirmed ? '1' : '0';
+                    if (!confirmed) event.preventDefault();
+                });
+                form.querySelector('button').disabled = false;
+            });
             var links = root.querySelectorAll('[data-nsr-tab]');
             var panels = root.querySelectorAll('[data-nsr-panel]');
             // Keep the selected area after a form submission, including validation errors.

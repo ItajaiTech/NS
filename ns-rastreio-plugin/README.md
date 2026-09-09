@@ -540,3 +540,7 @@ Com isso habilitado, ao clicar em um dos botoes de envio Tiny:
 - os NS sao enviados para `dados_pedido.obs_interna` (e opcionalmente `obs`).
 
 Ao clicar em `Finalizar e salvar NS`, o plugin apenas salva no banco local (sem envio automatico ao Tiny).
+
+Em **Bipagens salvas**, use **Excluir bipagem** para remover os registros de NS daquele pedido e nota fiscal da base local. A confirmacao identifica ambos e permite cancelar antes da exclusao.
+
+Na sessao aberta, use **Adicionar SKU**, **Alterar quantidade**, **Excluir SKU** e **Rebipar SKU**. Rebipar limpa os NS do item para nova leitura; tambem e possivel remover um NS individual pelo botao com seu numero. Clique em **Finalizar e salvar NS** para substituir a bipagem salva pelas alteracoes.
