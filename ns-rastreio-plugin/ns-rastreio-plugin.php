@@ -1618,6 +1618,15 @@ function nsr_is_valid_prd_sku($sku) {
 }
 
 /**
+ * Valida um SKU informado explicitamente no cadastro, XML ou sessao.
+ * A extracao de texto livre do PDF usa a regra PRD para evitar falsos positivos.
+ */
+function nsr_is_valid_sku($sku) {
+    $sku = trim((string) $sku);
+    return strlen($sku) <= 255 && (bool) preg_match('/\A[A-Z0-9][A-Z0-9 ._\/-]*\z/i', $sku);
+}
+
+/**
  * Identifica se token parece SKU valido.
  *
  * @param string $token
@@ -3053,8 +3062,8 @@ function nsr_handle_product_manual_submission() {
         return $messages;
     }
 
-    if (!nsr_is_valid_prd_sku($sku)) {
-        $messages['error'][] = 'SKU invalido. Use o padrao PRD + numeros (ex.: PRD00069).';
+    if (!nsr_is_valid_sku($sku)) {
+        $messages['error'][] = 'SKU invalido. Use ate 255 caracteres: letras, numeros, espacos, ponto, hifen, barra ou sublinhado (ex.: CPU I3 2120).';
         return $messages;
     }
 
@@ -3217,16 +3226,15 @@ function nsr_parse_xml_nfe($file_path) {
             $pedido = trim((string) $prod->xPed);
         }
 
-        // XML pode vir com cProd sem o padrao interno PRD000XX.
-        // Quando isso acontecer, tenta extrair SKU valido da descricao do item.
-        if (!nsr_is_valid_prd_sku($sku)) {
+        // Se cProd estiver invalido, tenta recuperar o codigo PRD da descricao.
+        if (!nsr_is_valid_sku($sku)) {
             $desc_upper = strtoupper(remove_accents($descricao));
             if (preg_match('/\b(PRD\d{5})\b/', $desc_upper, $m_sku_desc)) {
                 $sku = strtoupper((string) $m_sku_desc[1]);
             }
         }
 
-        if (!nsr_is_valid_prd_sku($sku)) {
+        if (!nsr_is_valid_sku($sku)) {
             continue;
         }
 
@@ -3383,7 +3391,7 @@ function nsr_handle_pdf_scan_workflow_submission() {
                 $parts = preg_split('/[;|,\t]/', $line, 2);
                 $sku_raw = isset($parts[0]) ? strtoupper(trim($parts[0])) : '';
                 $qty_raw = isset($parts[1]) ? trim($parts[1]) : '1';
-                if ($sku_raw === '' || !nsr_is_valid_prd_sku($sku_raw)) {
+                if ($sku_raw === '' || !nsr_is_valid_sku($sku_raw)) {
                     continue;
                 }
                 $qty = nsr_parse_quantity_value($qty_raw);
@@ -4237,7 +4245,7 @@ function nsr_collect_serials_by_sku($session) {
     $itens = isset($session['itens']) && is_array($session['itens']) ? $session['itens'] : array();
 
     foreach ($itens as $sku => $item) {
-        if (!nsr_is_probable_sku((string) $sku)) {
+        if (!nsr_is_valid_sku((string) $sku)) {
             continue;
         }
 
@@ -5787,12 +5795,12 @@ function nsr_render_admin_page() {
         </form>
 
         <h3>Cadastrar produto manualmente</h3>
-        <p>Use este formulario quando chegar SKU novo no pedido (ex.: PRD000XX) e ele ainda nao estiver na base.</p>
+        <p>Use este formulario quando chegar SKU novo no pedido (ex.: PRD00069 ou CPU I3 2120) e ele ainda nao estiver na base.</p>
         <form method="post" style="margin-bottom:24px;display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;">
             <?php wp_nonce_field('nsr_product_manual', 'nsr_product_manual_nonce'); ?>
             <label style="display:flex;flex-direction:column;gap:4px;">
                 SKU
-                <input type="text" name="nsr_product_sku" placeholder="Ex: PRD00016" required style="min-width:180px;" />
+                <input type="text" name="nsr_product_sku" placeholder="Ex: PRD00016 ou CPU I3 2120" maxlength="255" required style="min-width:260px;" />
             </label>
             <label style="display:flex;flex-direction:column;gap:4px;flex:1;min-width:260px;">
                 Descricao
