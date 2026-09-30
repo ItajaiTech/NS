@@ -2,7 +2,7 @@
 /*
  * Plugin Name: NS Rastreio
  * Description: Importa planilhas Excel/CSV para consultar NS e encontrar numero da NF ou numero do pedido.
- * Version: 1.5.4
+ * Version: 1.5.5
  * Author: Itajaitech
  */
 
@@ -10,7 +10,7 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('NSR_PLUGIN_VERSION', '1.5.4');
+define('NSR_PLUGIN_VERSION', '1.5.5');
 define('NSR_PLUGIN_SLUG', 'ns-rastreio');
 
 /**
@@ -6219,7 +6219,7 @@ function nsr_render_admin_page() {
                         });
                 };
 
-                function updateRow(data) {
+                function updateRow(data, autoAdvance) {
                     var row = document.querySelector('#nsr-sku-table tbody tr[data-sku="'+data.sku+'"]');
                     if (!row) return;
                     row.querySelector('.nsr-count').textContent   = data.scanned_count;
@@ -6242,7 +6242,7 @@ function nsr_render_admin_page() {
                         nsList.appendChild(btn);
                     });
                     // Auto advance to next pending SKU
-                    if (data.is_ok && activeSku === data.sku) {
+                    if (autoAdvance !== false && data.is_ok && activeSku === data.sku) {
                         var rows = document.querySelectorAll('#nsr-sku-table tbody tr');
                         for(var i=0;i<rows.length;i++){
                             if(parseInt(rows[i].querySelector('.nsr-count').textContent,10) <
@@ -6254,43 +6254,83 @@ function nsr_render_admin_page() {
                     }
                 }
 
-                // ----- Bipar NS -----
-                window.nsrScanNs = function() {
-                    var ns = document.getElementById('nsr-inp-ns').value.trim();
-                    if (!activeSku || !ns) {
-                        showFeedback(activeSku ? 'Digite o NS.' : 'Selecione um SKU primeiro.', 'error');
-                        return;
-                    }
-                    var pedido = document.getElementById('nsr-inp-pedido').value.trim();
-                    var nf     = document.getElementById('nsr-inp-nf').value.trim();
+                // Capture immediately; serialize writes to the shared scan session.
+                var scanQueue = [];
+                var scanBusy = false;
+                var scanErrors = [];
+                var scanLastResult = null;
+                var scanAdvanceTimer = null;
+
+                function scansPending() {
+                    if (!scanBusy && !scanQueue.length) return false;
+                    showFeedback('Aguarde a gravacao dos NS recebidos antes de continuar.', 'warn');
+                    return true;
+                }
+
+                function processScanQueue() {
+                    if (scanBusy || !scanQueue.length) return;
+                    scanBusy = true;
+                    var scan = scanQueue.shift();
                     var fd = new FormData();
-                    fd.append('action',      'nsr_scan_ns');
-                    fd.append('nonce',       NONCE);
-                    fd.append('token',       TOKEN);
-                    fd.append('sku',         activeSku);
-                    fd.append('ns',          ns);
-                    fd.append('pedido',      pedido);
-                    fd.append('nota_fiscal', nf);
+                    fd.append('action', 'nsr_scan_ns');
+                    fd.append('nonce', NONCE);
+                    fd.append('token', TOKEN);
+                    fd.append('sku', scan.sku);
+                    fd.append('ns', scan.ns);
+                    fd.append('pedido', scan.pedido);
+                    fd.append('nota_fiscal', scan.nf);
                     fetch(AJAXURL, {method:'POST', body:fd})
                         .then(function(r){ return r.json(); })
                         .then(function(res){
                             if (res.success) {
-                                document.getElementById('nsr-inp-ns').value = '';
-                                document.getElementById('nsr-inp-ns').focus();
-                                updateRow(res.data);
-                                showFeedback('NS ' + res.data.ns + ' bipado (' + res.data.scanned_count + '/' + res.data.expected + ')', 'ok');
-                                document.getElementById('nsr-hdr-pedido').textContent = pedido;
-                                document.getElementById('nsr-hdr-nf').textContent     = nf;
+                                updateRow(res.data, false);
+                                scanLastResult = res.data;
+                                document.getElementById('nsr-hdr-pedido').textContent = scan.pedido;
+                                document.getElementById('nsr-hdr-nf').textContent = scan.nf;
                             } else {
-                                showFeedback(res.data.msg, 'error');
-                                document.getElementById('nsr-inp-ns').select();
+                                scanErrors.push(scan.ns + ': ' + res.data.msg);
                             }
                         })
-                        .catch(function(){ showFeedback('Erro de comunicacao com o servidor.', 'error'); });
+                        .catch(function(){
+                            scanErrors.push(scan.ns + ': falha de comunicacao; confira se foi gravado antes de bipar novamente.');
+                        })
+                        .then(function(){
+                            scanBusy = false;
+                            if (scanQueue.length) {
+                                processScanQueue();
+                                return;
+                            }
+                            if (scanErrors.length) {
+                                showFeedback('Confira os NS: ' + scanErrors.join(' | '), 'error');
+                            } else if (scanLastResult) {
+                                showFeedback('NS gravados (' + scanLastResult.scanned_count + '/' + scanLastResult.expected + ')', 'ok');
+                            }
+                            // Wait for the reader to finish before advancing to another SKU.
+                            clearTimeout(scanAdvanceTimer);
+                            scanAdvanceTimer = setTimeout(function(){
+                                if (!scanBusy && !scanQueue.length && !scanErrors.length &&
+                                    !document.getElementById('nsr-inp-ns').value && scanLastResult) {
+                                    updateRow(scanLastResult);
+                                }
+                            }, 300);
+                        });
+                }
+
+                window.nsrScanNs = function() {
+                    var input = document.getElementById('nsr-inp-ns');
+                    var ns = input.value.trim();
+                    // CR/LF readers can send two Enters for one line.
+                    if (!ns) return;
+                    if (!activeSku) {
+                        showFeedback('Selecione um SKU primeiro.', 'error');
+                        return;
+                    }
+                    window.nsrScanMultipleNs(ns.split(/[\r\n,;|\s]+/));
                 };
 
                 // ----- Gerar sequencia de NS -----
                 window.nsrGenerateSequentialNs = function() {
+                    if (scansPending()) return;
                     var nsStart = document.getElementById('nsr-inp-ns').value.trim();
                     var autoQty = document.getElementById('nsr-inp-seq-auto').checked;
                     var qtyRaw  = document.getElementById('nsr-inp-seq-qty').value;
@@ -6359,58 +6399,20 @@ function nsr_render_admin_page() {
                         showFeedback('Selecione um SKU primeiro.', 'error');
                         return;
                     }
-                    if (!Array.isArray(nsList) || nsList.length === 0) {
-                        showFeedback('Nenhum NS para bipar.', 'error');
-                        return;
-                    }
-
+                    if (!Array.isArray(nsList)) return;
+                    var values = nsList.map(function(ns){ return ns.trim(); }).filter(Boolean);
+                    if (!values.length) return;
                     var pedido = document.getElementById('nsr-inp-pedido').value.trim();
-                    var nf     = document.getElementById('nsr-inp-nf').value.trim();
-                    var processed = 0;
-                    var successful = 0;
-                    var failed = 0;
-
-                    function processNext() {
-                        if (processed >= nsList.length) {
-                            showFeedback(successful + ' NS bipados, ' + failed + ' erros.', failed === 0 ? 'ok' : 'warn');
-                            document.getElementById('nsr-inp-ns').focus();
-                            return;
-                        }
-
-                        var ns = nsList[processed++].trim();
-                        if (!ns) {
-                            setTimeout(processNext, 100);
-                            return;
-                        }
-
-                        var fd = new FormData();
-                        fd.append('action',      'nsr_scan_ns');
-                        fd.append('nonce',       NONCE);
-                        fd.append('token',       TOKEN);
-                        fd.append('sku',         activeSku);
-                        fd.append('ns',          ns);
-                        fd.append('pedido',      pedido);
-                        fd.append('nota_fiscal', nf);
-
-                        fetch(AJAXURL, {method:'POST', body:fd})
-                            .then(function(r){ return r.json(); })
-                            .then(function(res){
-                                if (res.success) {
-                                    updateRow(res.data);
-                                    successful++;
-                                    document.getElementById('nsr-hdr-pedido').textContent = pedido;
-                                    document.getElementById('nsr-hdr-nf').textContent     = nf;
-                                } else {
-                                    failed++;
-                                }
-                                setTimeout(processNext, 200);
-                            })
-                            .catch(function(){ failed++; setTimeout(processNext, 200); });
-                    }
-
+                    var nf = document.getElementById('nsr-inp-nf').value.trim();
+                    clearTimeout(scanAdvanceTimer);
+                    values.forEach(function(ns){
+                        scanQueue.push({ns: ns, sku: activeSku, pedido: pedido, nf: nf});
+                    });
+                    // Never clear/select this input from an asynchronous response.
                     document.getElementById('nsr-inp-ns').value = '';
-                    showFeedback('Bipando ' + nsList.length + ' NS(s)...', 'warn');
-                    processNext();
+                    document.getElementById('nsr-inp-ns').focus();
+                    showFeedback('Gravando NS recebidos...', 'warn');
+                    processScanQueue();
                 };
 
                 // Event listener: paste Ctrl+V no campo de NS
@@ -6436,6 +6438,7 @@ function nsr_render_admin_page() {
 
                 // ----- Remover NS -----
                 window.nsrRemoveNs = function(btn) {
+                    if (scansPending()) return;
                     if (!confirm('Remover NS ' + btn.dataset.ns + '?')) return;
                     var fd = new FormData();
                     fd.append('action', 'nsr_remove_ns');
@@ -6457,6 +6460,7 @@ function nsr_render_admin_page() {
 
                 // ----- Finalizar -----
                 window.nsrFinalize = function() {
+                    if (scansPending()) return;
                     var pedido = document.getElementById('nsr-inp-pedido').value.trim();
                     var nf     = document.getElementById('nsr-inp-nf').value.trim();
                     if (!pedido && !nf) {
@@ -6485,6 +6489,7 @@ function nsr_render_admin_page() {
 
                 // ----- Enviar Tiny (manual) -----
                 window.nsrSendTiny = function(tinySystem) {
+                    if (scansPending()) return;
                     var pedido = document.getElementById('nsr-inp-pedido').value.trim();
                     var nf     = document.getElementById('nsr-inp-nf').value.trim();
                     var systemLabels = {kdt:'KDT', teke:'TEKE', tech:'TECH'};
@@ -6521,6 +6526,7 @@ function nsr_render_admin_page() {
 
                 // ----- Cancelar -----
                 window.nsrCancel = function() {
+                    if (scansPending()) return;
                     if (!confirm('Cancelar a sessao? Os NS bipados serao descartados.')) return;
                     var fd = new FormData();
                     fd.append('action', 'nsr_cancel_session');

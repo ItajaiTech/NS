@@ -8,7 +8,7 @@ A lista **Bipagens salvas** permite buscar pelo pedido ou nota fiscal (numero co
 
 O painel administrativo esta organizado nas abas **Bipagem**, **Consultar NS**, **Produtos**, **Importar / Exportar** e **Integracao Tiny**. A troca de abas preserva a sessao de bipagem aberta na pagina.
 
-Versao atual: `1.5.4`
+Versao atual: `1.5.5`
 
 ## Requisitos
 
