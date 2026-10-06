@@ -3,6 +3,7 @@ define('ABSPATH', __DIR__);
 define('ARRAY_A', 'ARRAY_A');
 function nsr_get_table_name() { return 'wp_ns_rastreio'; }
 function remove_accents($text) { return $text; }
+function nsr_enrich_product_records($rows) { return $rows; }
 class WP_Error {
     public function __construct($code, $message) { $this->message = $message; }
     public function get_error_message() { return $this->message; }

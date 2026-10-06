@@ -2,7 +2,7 @@
 /*
  * Plugin Name: NS Rastreio
  * Description: Importa planilhas Excel/CSV para consultar NS e encontrar numero da NF ou numero do pedido.
- * Version: 1.5.6
+ * Version: 1.5.8
  * Author: Itajaitech
  */
 
@@ -10,9 +10,10 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('NSR_PLUGIN_VERSION', '1.5.6');
+define('NSR_PLUGIN_VERSION', '1.5.8');
 define('NSR_PLUGIN_SLUG', 'ns-rastreio');
 require_once __DIR__ . '/includes/batch-search.php';
+require_once __DIR__ . '/includes/product-catalog.php';
 
 /**
  * Extrai NSs individuais de uma celula que pode conter texto misto.
@@ -645,6 +646,9 @@ function nsr_detect_columns($header_row) {
         // NS vem de "Observacoes internas"
         if ($mapping['ns'] === null) {
             $ns_candidates = array(
+                'NS ENCONTRADO',
+                'NS',
+                'NUMERO DE SERIE',
                 'OBSERVACOES INTERNAS',
                 'OBSERVACAO INTERNA',
                 'OBS INTERNAS',
@@ -653,7 +657,7 @@ function nsr_detect_columns($header_row) {
             );
 
             foreach ($ns_candidates as $candidate) {
-                if (nsr_header_contains_phrase($label, $candidate)) {
+                if (($candidate === 'NS' && $label === 'NS') || ($candidate !== 'NS' && nsr_header_contains_phrase($label, $candidate))) {
                     $mapping['ns'] = (int) $index;
                     break;
                 }
@@ -679,7 +683,7 @@ function nsr_detect_columns($header_row) {
         }
 
         // Pedido: "Numero" (generico, por isso verificado por ultimo)
-        if ($mapping['pedido'] === null && $label === 'NUMERO') {
+        if ($mapping['pedido'] === null && in_array($label, array('NUMERO', 'PEDIDO', 'NUMERO DO PEDIDO', 'NUMERO PEDIDO'), true)) {
             $mapping['pedido'] = (int) $index;
         }
 
@@ -752,11 +756,18 @@ function nsr_detect_columns($header_row) {
         }
 
         // Data: "Data da venda"
+        if ($mapping['data_venda'] === null && $label === 'DATA') {
+            $mapping['data_venda'] = (int) $index;
+        }
         if ($mapping['data_venda'] === null) {
             $data_candidates = array(
                 'DATA DA VENDA',
+                'DATA DE VENDA',
                 'DATA VENDA',
-                'DATA',
+                'DATA DA COMPRA',
+                'DATA COMPRA',
+                'DATA DA NOTA FISCAL',
+                'DATA NOTA FISCAL',
             );
 
             foreach ($data_candidates as $candidate) {
@@ -962,26 +973,10 @@ function nsr_import_products_file($file_path, $file_name) {
  * @return array
  */
 function nsr_get_products_by_skus($skus) {
-    global $wpdb;
-
-    $skus = array_values(array_unique(array_filter(array_map('strtoupper', $skus))));
-    if (empty($skus)) {
-        return array();
-    }
-
-    $table = nsr_get_products_table_name();
-    $placeholders = implode(',', array_fill(0, count($skus), '%s'));
-    $sql = $wpdb->prepare(
-        "SELECT sku, descricao FROM {$table} WHERE sku IN ({$placeholders})",
-        $skus
-    );
-
-    $rows = $wpdb->get_results($sql, ARRAY_A);
     $map = array();
-    foreach ($rows as $row) {
-        $map[strtoupper((string) $row['sku'])] = (string) $row['descricao'];
+    foreach (nsr_get_catalog_products($skus) as $key => $product) {
+        $map[$key] = (string) $product['descricao'];
     }
-
     return $map;
 }
 
@@ -2556,10 +2551,10 @@ function nsr_recompute_scan_session_flags($session) {
 
     $missing_skus = array();
     foreach ($skus as $sku) {
-        if (!isset($products_map[$sku])) {
+        if (!isset($products_map[nsr_catalog_sku_key($sku)])) {
             $missing_skus[] = $sku;
-        } elseif (empty($session['itens'][$sku]['descricao'])) {
-            $session['itens'][$sku]['descricao'] = (string) $products_map[$sku];
+        } elseif ($products_map[nsr_catalog_sku_key($sku)] !== '') {
+            $session['itens'][$sku]['descricao'] = (string) $products_map[nsr_catalog_sku_key($sku)];
         }
     }
 
@@ -2594,7 +2589,7 @@ function nsr_import_file($file_path, $file_name) {
     if ($mapping['ns'] === null) {
         return new WP_Error(
             'nsr_ns_column_missing',
-            'Nao foi encontrada coluna de NS. Certifique-se de ter a coluna "Observacoes internas" com o numero de serie.'
+            'Nao foi encontrada coluna de NS. Use a coluna "NS", "NS encontrado" ou "Observacoes internas".'
         );
     }
 
@@ -2733,7 +2728,7 @@ function nsr_find_by_ns($ns, $partial = false, $limit = 100) {
                 $limit
             );
 
-            return $wpdb->get_results($sql, ARRAY_A);
+            return nsr_enrich_product_records($wpdb->get_results($sql, ARRAY_A));
         }
 
         $sql = $wpdb->prepare(
@@ -2747,7 +2742,7 @@ function nsr_find_by_ns($ns, $partial = false, $limit = 100) {
             $limit
         );
 
-        return $wpdb->get_results($sql, ARRAY_A);
+        return nsr_enrich_product_records($wpdb->get_results($sql, ARRAY_A));
     }
 
     $sql = $wpdb->prepare(
@@ -2760,7 +2755,7 @@ function nsr_find_by_ns($ns, $partial = false, $limit = 100) {
         $limit
     );
 
-    return $wpdb->get_results($sql, ARRAY_A);
+    return nsr_enrich_product_records($wpdb->get_results($sql, ARRAY_A));
 }
 
 /**
@@ -2827,7 +2822,7 @@ function nsr_find_admin_records($value, $search_type = 'ns', $partial = false, $
             );
         }
 
-        return $wpdb->get_results($sql, ARRAY_A);
+        return nsr_enrich_product_records($wpdb->get_results($sql, ARRAY_A));
     }
 
     if ($value_normalized !== '' && $value_normalized !== $value_raw) {
@@ -2853,7 +2848,7 @@ function nsr_find_admin_records($value, $search_type = 'ns', $partial = false, $
         );
     }
 
-    return $wpdb->get_results($sql, ARRAY_A);
+    return nsr_enrich_product_records($wpdb->get_results($sql, ARRAY_A));
 }
 
 /**
@@ -2988,6 +2983,10 @@ function nsr_handle_products_import_submission() {
     }
 
     check_admin_referer('nsr_products_import', 'nsr_products_nonce');
+    if (nsr_rma_products_available()) {
+        $messages['error'][] = 'O catalogo esta vinculado ao RMA. Importe os produtos no RMA.';
+        return $messages;
+    }
 
     if (empty($_FILES['nsr_products_file']) || !is_array($_FILES['nsr_products_file'])) {
         $messages['error'][] = 'Nenhum arquivo de produtos foi enviado.';
@@ -3054,6 +3053,10 @@ function nsr_handle_product_manual_submission() {
     }
 
     check_admin_referer('nsr_product_manual', 'nsr_product_manual_nonce');
+    if (nsr_rma_products_available()) {
+        $messages['error'][] = 'O catalogo esta vinculado ao RMA. Cadastre o produto no RMA.';
+        return $messages;
+    }
 
     $sku = strtoupper(sanitize_text_field(wp_unslash($_POST['nsr_product_sku'] ?? '')));
     $descricao = sanitize_text_field(wp_unslash($_POST['nsr_product_descricao'] ?? ''));
@@ -3724,7 +3727,9 @@ function nsr_handle_export_csv() {
 
     @set_time_limit(0);
 
-    $filename = 'ns-rastreio-export-' . gmdate('Ymd-His') . '.csv';
+    $layout = isset($_POST['nsr_export_layout']) && $_POST['nsr_export_layout'] === 'ns' ? 'ns' : 'olist';
+    $template_only = isset($_POST['nsr_export_template']);
+    $filename = ($template_only ? 'ns-modelo-' : 'ns-rastreio-export-') . $layout . '-'  . gmdate('Ymd-His') . '.csv';
 
     nocache_headers();
     header('Content-Type: text/csv; charset=utf-8');
@@ -3740,18 +3745,16 @@ function nsr_handle_export_csv() {
 
     fputcsv(
         $output,
-        array(
-            'Numero',
-            'Numero (Nota Fiscal)',
-            'Quantidade de produtos',
-            'Valor total da venda',
-            'Observacoes internas',
-            'Codigo (SKU)',
-            'Descricao do produto',
-            'Data da venda',
-        ),
+        $layout === 'ns'
+            ? array('NS', 'Nota fiscal', 'Pedido', 'SKU', 'Descricao', 'Data de venda', 'GTIN/EAN', 'Expiracao', 'Quantidade', 'Valor')
+            : array('Numero', 'Numero (Nota Fiscal)', 'Quantidade de produtos', 'Valor total da venda', 'Observacoes internas', 'Codigo (SKU)', 'Descricao do produto', 'Data da venda'),
         ';'
     );
+
+    if ($template_only) {
+        fclose($output);
+        exit;
+    }
 
     global $wpdb;
     $table_name = nsr_get_table_name();
@@ -3775,18 +3778,25 @@ function nsr_handle_export_csv() {
             break;
         }
 
-        foreach ($rows as $row) {
+        foreach (($layout === 'ns' ? nsr_enrich_product_records($rows) : $rows) as $row) {
             fputcsv(
                 $output,
-                array(
-                    (string) $row['pedido'],
-                    (string) $row['nota_fiscal'],
-                    (string) $row['quantidade'],
-                    (string) $row['valor'],
+                $layout === 'ns' ? array(
                     (string) $row['ns'],
+                    (string) $row['nota_fiscal'],
+                    (string) $row['pedido'],
                     (string) $row['sku'],
                     (string) $row['descricao'],
-                    (string) $row['data_venda'],
+                    nsr_format_sale_date($row['data_venda']),
+                    (string) ($row['gtin'] ?? ''),
+                    nsr_batch_expiration($row['data_venda']),
+                    (string) $row['quantidade'],
+                    (string) $row['valor'],
+                ) : array(
+                    (string) $row['pedido'], (string) $row['nota_fiscal'],
+                    (string) $row['quantidade'], (string) $row['valor'],
+                    (string) $row['ns'], (string) $row['sku'],
+                    (string) $row['descricao'], (string) $row['data_venda']
                 ),
                 ';'
             );
@@ -5682,7 +5692,8 @@ function nsr_render_admin_page() {
     }
 
     $table_name = nsr_get_table_name();
-    $products_table = nsr_get_products_table_name();
+    $rma_catalog_available = nsr_rma_products_available();
+    $products_table = $rma_catalog_available ? $wpdb->prefix . 'rma_produtos' : nsr_get_products_table_name();
     $total_records = (int) $wpdb->get_var("SELECT COUNT(1) FROM {$table_name}");
     $total_ns_unicos = (int) $wpdb->get_var("SELECT COUNT(DISTINCT ns_normalizado) FROM {$table_name}");
     $total_products = (int) $wpdb->get_var("SELECT COUNT(1) FROM {$products_table}");
@@ -5771,8 +5782,8 @@ function nsr_render_admin_page() {
         </nav>
         <section id="nsr-section-import" class="nsr-panel" data-nsr-panel="arquivos"<?php echo $active_tab !== 'arquivos' ? ' hidden' : ''; ?>>
         <h2>Importar planilhas de NS</h2>
-        <p>Envie arquivos <code>.xlsx</code> ou <code>.csv</code> com cabecalho. Colunas obrigatorias: <code>Observacoes internas</code> (NS), <code>Numero (Nota Fiscal)</code> e <code>Numero</code> (Pedido).</p>
-        <p>Colunas opcionais: <code>Codigo (SKU)</code>, <code>Descricao do produto</code>, <code>Quantidade de produtos</code>, <code>Valor total da venda</code>, <code>Data da venda</code>.</p>
+        <p>Envie arquivos <code>.xlsx</code> ou <code>.csv</code> com cabecalho. Colunas obrigatorias: <code>NS</code> e pelo menos uma das colunas <code>Nota fiscal</code> ou <code>Pedido</code>. Os cabecalhos antigos continuam aceitos.</p>
+        <p>Colunas opcionais: <code>SKU</code>, <code>Descricao</code>, <code>Data de venda</code>, <code>Quantidade</code> e <code>Valor</code>. Use uma linha por NS e datas em DD/MM/AAAA. GTIN/EAN vem do RMA e Expiracao e calculada automaticamente; essas duas colunas nao alteram o cadastro na importacao.</p>
 
         <form method="post" enctype="multipart/form-data" style="margin-bottom:24px;">
             <?php wp_nonce_field('nsr_import_files', 'nsr_import_nonce'); ?>
@@ -5785,7 +5796,13 @@ function nsr_render_admin_page() {
         </section>
 
         <section id="nsr-section-products" class="nsr-panel" data-nsr-panel="produtos"<?php echo $active_tab !== 'produtos' ? ' hidden' : ''; ?>>
-        <h2>Importar base de produtos</h2>
+        <h2>Cadastro de produtos</h2>
+        <?php if ($rma_catalog_available) : ?>
+            <p><strong>Catalogo RMA conectado.</strong> Os produtos sao vinculados pelo SKU. Nome e GTIN/EAN sao consultados no RMA; alteracoes no catalogo aparecem automaticamente no NS.</p>
+            <p>Cadastre e edite os produtos no RMA. A validacao da bipagem usa os SKUs desse catalogo.</p>
+        <?php else : ?>
+            <p>Catalogo RMA nao encontrado neste WordPress. A base local do NS continua disponivel. Instale o RMA no mesmo site para ativar o vinculo por SKU.</p>
+        <h3>Importar base local de produtos</h3>
         <p>Envie arquivo <code>.xlsx</code> ou <code>.csv</code> com colunas de SKU e descricao para validar o pedido do PDF.</p>
         <form method="post" enctype="multipart/form-data" style="margin-bottom:24px;">
             <?php wp_nonce_field('nsr_products_import', 'nsr_products_nonce'); ?>
@@ -5810,6 +5827,7 @@ function nsr_render_admin_page() {
             <button type="submit" name="nsr_product_manual_submit" class="button button-primary">Salvar produto</button>
         </form>
 
+        <?php endif; ?>
         </section>
 
         <section id="nsr-section-tiny" class="nsr-panel" data-nsr-panel="tiny"<?php echo $active_tab !== 'tiny' ? ' hidden' : ''; ?>>
@@ -6545,11 +6563,16 @@ function nsr_render_admin_page() {
 
         <section id="nsr-section-export" class="nsr-panel" data-nsr-panel="arquivos"<?php echo $active_tab !== 'arquivos' ? ' hidden' : ''; ?>>
         <h2>Exportar planilha</h2>
-        <p>Baixe um <code>.csv</code> com todos os registros no mesmo layout de importacao do plugin (ideal para levar para outra hospedagem).</p>
+        <p>Escolha o padrao Olist original ou o novo modelo NS com NS, nota fiscal, pedido, SKU, descricao, data de venda, GTIN/EAN e expiracao. Ambos podem ser importados no NS. O modelo vazio contem somente os cabecalhos para preenchimento.</p>
         <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-bottom:24px;">
             <input type="hidden" name="action" value="nsr_export_csv" />
             <?php wp_nonce_field('nsr_export_csv', 'nsr_export_nonce'); ?>
+            <label>Formato da planilha <select name="nsr_export_layout">
+                <option value="olist">Padrao Olist (layout original)</option>
+                <option value="ns">Modelo NS (colunas da consulta)</option>
+            </select></label>
             <button type="submit" class="button button-secondary">Exportar CSV completo</button>
+            <button type="submit" name="nsr_export_template" value="1" class="button">Baixar modelo vazio</button>
         </form>
 
         </section>

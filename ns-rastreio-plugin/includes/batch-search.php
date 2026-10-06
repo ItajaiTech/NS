@@ -28,7 +28,7 @@ function nsr_find_batch_serials($serials) {
         if ($rows === null || $wpdb->last_error !== '') {
             return new WP_Error('nsr_batch_query', 'Nao foi possivel consultar os NS. Tente novamente.');
         }
-        foreach ($rows as $row) {
+        foreach (nsr_enrich_product_records($rows) as $row) {
             $key = nsr_normalize_lookup_value($row['ns_normalizado']);
             if (isset($groups[$key])) {
                 $groups[$key][] = $row;
@@ -39,6 +39,17 @@ function nsr_find_batch_serials($serials) {
 }
 
 /** Strict dates; month-end anniversaries stay in the target month. */
+function nsr_format_sale_date($value) {
+    foreach (array('!d/m/Y', '!Y-m-d', '!d-m-Y', '!Y-m-d H:i:s', '!d/m/Y H:i:s') as $format) {
+        $date = DateTimeImmutable::createFromFormat($format, trim((string) $value));
+        $errors = DateTimeImmutable::getLastErrors();
+        if ($date && (!$errors || (!$errors['warning_count'] && !$errors['error_count']))) {
+            return $date->format('d/m/Y');
+        }
+    }
+    return (string) $value;
+}
+
 function nsr_batch_expiration($value) {
     $date = false;
     foreach (array('!d/m/Y', '!Y-m-d', '!d-m-Y', '!Y-m-d H:i:s', '!d/m/Y H:i:s') as $format) {
@@ -105,16 +116,16 @@ function nsr_render_batch_search($context) {
             <p>Expiracao: data da compra/nota fiscal + 2 anos. Todas as notas encontradas para cada NS aparecem abaixo.</p>
             <div style="overflow-x:auto;">
             <table class="widefat striped" style="width:100%;text-align:left;">
-                <thead><tr><th>NS consultado</th><th>Resultado</th><th>NS encontrado</th><th>Nota fiscal</th><th>Pedido</th><th>SKU</th><th>Descricao</th><th>Data de venda</th><th>Expiracao</th></tr></thead>
+                <thead><tr><th>NS consultado</th><th>Resultado</th><th>NS encontrado</th><th>Nota fiscal</th><th>Pedido</th><th>SKU</th><th>Descricao</th><th>GTIN/EAN</th><th>Data de venda</th><th>Expiracao</th></tr></thead>
                 <tbody>
                 <?php foreach ($groups as $key => $rows) : ?>
                     <?php if (!$rows) : ?>
-                        <tr><td><?php echo esc_html($serials[$key]); ?></td><td>Nao encontrado</td><td colspan="7">&mdash;</td></tr>
+                        <tr><td><?php echo esc_html($serials[$key]); ?></td><td>Nao encontrado</td><td colspan="8">&mdash;</td></tr>
                     <?php else : foreach ($rows as $row) : ?>
                         <tr>
                             <td><?php echo esc_html($serials[$key]); ?></td><td>Encontrado</td>
-                            <?php foreach (array('ns', 'nota_fiscal', 'pedido', 'sku', 'descricao', 'data_venda') as $column) : ?>
-                                <td><?php echo esc_html($row[$column] !== '' ? $row[$column] : 'Nao informado'); ?></td>
+                            <?php foreach (array('ns', 'nota_fiscal', 'pedido', 'sku', 'descricao', 'gtin', 'data_venda') as $column) : ?>
+                                <td><?php echo esc_html($row[$column] !== '' ? ($column === 'data_venda' ? nsr_format_sale_date($row[$column]) : $row[$column]) : 'Nao informado'); ?></td>
                             <?php endforeach; ?>
                             <td><?php echo esc_html(nsr_batch_expiration($row['data_venda'])); ?></td>
                         </tr>

@@ -8,7 +8,31 @@ A lista **Bipagens salvas** permite buscar pelo pedido ou nota fiscal (numero co
 
 O painel administrativo esta organizado nas abas **Bipagem**, **Consultar NS**, **Produtos**, **Importar / Exportar** e **Integracao Tiny**. A troca de abas preserva a sessao de bipagem aberta na pagina.
 
-Versao atual: `1.5.6`
+Versao atual: `1.5.8`
+
+## Importacao/exportacao 1.5.8
+
+Em Importar / Exportar, selecione **Padrao Olist** (layout original preservado) ou
+**Modelo NS**. Use Exportar CSV completo para os dados ou Baixar modelo vazio
+para obter apenas os cabecalhos. A importacao reconhece os dois formatos.
+
+O CSV do Modelo NS usa: NS; Nota fiscal; Pedido; SKU; Descricao; Data de venda;
+GTIN/EAN; Expiracao; Quantidade; Valor. Datas validas sao exportadas em DD/MM/AAAA.
+O nome e GTIN/EAN sao consultados no RMA pelo SKU. A expiracao e calculada em 2 anos.
+A importacao aceita esse layout e os cabecalhos antigos. NS e pelo menos NF ou Pedido
+sao obrigatorios. GTIN/EAN e Expiracao sao informativos e nao alteram o RMA na importacao.
+Ao abrir CSV no Excel, importe NS, SKU, NF, Pedido e GTIN/EAN como texto para preservar zeros.
+
+## Catalogo compartilhado com RMA
+
+Com o RMA instalado no mesmo WordPress, o NS consulta automaticamente seu catalogo
+(`rma_produtos`) pelo SKU. A aba Produtos indica se o catalogo esta conectado.
+Cadastro/importacao de produtos passam a ser feitos no RMA. O NS usa esse catalogo
+para validar os SKUs da bipagem e atualizar as descricoes nas consultas individuais,
+por nota/pedido e em lote. A consulta em lote tambem mostra o GTIN/EAN do RMA.
+O vinculo preserva espacos, pontuacao e zeros do SKU e ignora diferencas de caixa.
+As notas, datas e numeros de serie continuam no NS. Registros sem SKU nao sao
+vinculados automaticamente. Sem catalogo RMA disponivel, a base local continua funcionando.
 
 ## Requisitos
 
