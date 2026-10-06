@@ -8,7 +8,7 @@ A lista **Bipagens salvas** permite buscar pelo pedido ou nota fiscal (numero co
 
 O painel administrativo esta organizado nas abas **Bipagem**, **Consultar NS**, **Produtos**, **Importar / Exportar** e **Integracao Tiny**. A troca de abas preserva a sessao de bipagem aberta na pagina.
 
-Versao atual: `1.5.5`
+Versao atual: `1.5.6`
 
 ## Requisitos
 
@@ -544,3 +544,12 @@ Ao clicar em `Finalizar e salvar NS`, o plugin apenas salva no banco local (sem 
 Em **Bipagens salvas**, use **Excluir bipagem** para remover os registros de NS daquele pedido e nota fiscal da base local. A confirmacao identifica ambos e permite cancelar antes da exclusao.
 
 Na sessao aberta, use **Adicionar SKU**, **Alterar quantidade**, **Excluir SKU** e **Rebipar SKU**. Rebipar limpa os NS do item para nova leitura; tambem e possivel remover um NS individual pelo botao com seu numero. Clique em **Finalizar e salvar NS** para substituir a bipagem salva pelas alteracoes.
+# Consulta de varios NS (1.5.6)
+
+Na aba **Consultar NS** e no shortcode `[ns_rastreio_consulta]`, use **Consultar varios NS**.
+Cole ate 500 numeros de serie ou bipe com o leitor enviando Enter ao final de cada NS.
+A consulta aceita linhas, espacos, virgulas e ponto e virgula; remove repetidos e busca o NS exato.
+Mostra encontrados e nao encontrados, todas as notas fiscais/pedidos associados, SKU, descricao,
+data da compra/nota fiscal registrada em `Data Venda` e expiracao da garantia apos **2 anos**.
+Datas ausentes ou invalidas ficam identificadas sem calcular expiracao. Para compras em 29/02,
+o aniversario em ano sem esse dia e 28/02. A consulta apenas le os registros existentes.

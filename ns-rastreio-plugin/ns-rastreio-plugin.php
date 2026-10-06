@@ -2,7 +2,7 @@
 /*
  * Plugin Name: NS Rastreio
  * Description: Importa planilhas Excel/CSV para consultar NS e encontrar numero da NF ou numero do pedido.
- * Version: 1.5.5
+ * Version: 1.5.6
  * Author: Itajaitech
  */
 
@@ -10,8 +10,9 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('NSR_PLUGIN_VERSION', '1.5.5');
+define('NSR_PLUGIN_VERSION', '1.5.6');
 define('NSR_PLUGIN_SLUG', 'ns-rastreio');
+require_once __DIR__ . '/includes/batch-search.php';
 
 /**
  * Extrai NSs individuais de uma celula que pode conter texto misto.
@@ -5731,7 +5732,7 @@ function nsr_render_admin_page() {
     if (!isset($panel_tabs[$active_tab])) {
         $active_tab = 'bipagem';
     }
-    if (isset($_GET['nsr_admin_ns'])) {
+    if (isset($_GET['nsr_admin_ns']) || (isset($_POST['nsr_batch_context']) && $_POST['nsr_batch_context'] === 'admin')) {
         $active_tab = 'consulta';
     }
     if (!empty($scan_session) || isset($_GET['nsr_saved_search']) || isset($_GET['nsr_saved_page'])) {
@@ -6617,6 +6618,7 @@ function nsr_render_admin_page() {
         <?php endif; ?>
 
         <hr style="margin:24px 0;" />
+        <?php nsr_render_batch_search('admin'); ?>
         <h3>Consulta no site</h3>
         <p>Para disponibilizar a consulta no site, crie uma pagina no WordPress com o shortcode <code>[ns_rastreio_consulta]</code>.</p>
         </section>
@@ -6687,6 +6689,7 @@ function nsr_render_shortcode() {
     ob_start();
     ?>
     <div class="nsr-widget" style="max-width:760px;padding:16px;border:1px solid #dcdcde;border-radius:8px;">
+        <?php nsr_render_batch_search('site'); ?>
         <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;">
             <input
                 type="text"
