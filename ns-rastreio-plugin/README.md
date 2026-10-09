@@ -8,7 +8,41 @@ A lista **Bipagens salvas** permite buscar pelo pedido ou nota fiscal (numero co
 
 O painel administrativo esta organizado nas abas **Bipagem**, **Consultar NS**, **Produtos**, **Importar / Exportar** e **Integracao Tiny**. A troca de abas preserva a sessao de bipagem aberta na pagina.
 
-Versao atual: `1.5.8`
+Versao atual: `1.6.0`
+
+## Layout para celular (1.6.0)
+
+Em telas de ate 782px, as tabelas aparecem como cartoes com os nomes dos campos.
+Toque no cartao do produto para selecionar o SKU. Quantidade, status e NS ficam
+no proprio cartao; expanda Editar este produto para alterar a quantidade ou rebipar.
+Campos de bipagem e botoes de sessao ficam em uma coluna. Finalizar e salvar NS
+aparece primeiro no grupo de acoes. Cadastro manual e adicao de SKU iniciam
+recolhidos no celular e podem ser abertos pelo titulo. No computador, as tabelas
+continuam com colunas. A mudanca de tamanho adapta a apresentacao automaticamente.
+
+## Uso no celular e camera (1.5.9)
+
+Entre no mesmo site WordPress em HTTPS com um usuario autorizado a administrar
+o NS Rastreio. Na aba Bipagem, selecione um PDF ou XML de NF-e 4.0 salvo em
+Arquivos/Downloads e clique em Ler PDF / XML. Selecione o SKU na tabela ou
+no cartao do produto em telas pequenas.
+
+Na sessao aberta, toque em Abrir camera e permita o acesso. O leitor prefere
+a camera traseira e pausa assim que encontra um QR. Confira os numeros no campo
+editavel e o SKU selecionado, depois toque em Registrar NS no SKU selecionado.
+Confira o resultado da gravacao antes de abrir a camera para a proxima etiqueta.
+Aceita um ou varios NS separados por linhas, espacos, virgulas, ponto e virgula
+ou pipe, preservando zeros iniciais. QR com links ou dados estruturados precisa
+ser corrigido para conter somente NS. O mesmo QR consecutivo para o mesmo SKU
+nao e reenviado; em caso de falha, confira a lista e use o campo manual para
+reenviar somente os NS ausentes.
+
+As imagens sao decodificadas no navegador com jsQR 1.4.0, incluido no plugin
+(licenca Apache 2.0 em assets/jsQR.LICENSE). A camera fecha apos a leitura, ao
+sair da pagina, trocar de aba ou colocar o navegador em segundo plano.
+O fluxo exige conexao com o servidor para gravar. A bipagem manual permanece
+disponivel. Esta versao foi validada com testes automatizados; a leitura e o
+layout ainda precisam de validacao em aparelhos Android/iPhone reais.
 
 ## Importacao/exportacao 1.5.8
 

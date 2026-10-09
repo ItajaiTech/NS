@@ -2,7 +2,7 @@
 /*
  * Plugin Name: NS Rastreio
  * Description: Importa planilhas Excel/CSV para consultar NS e encontrar numero da NF ou numero do pedido.
- * Version: 1.5.8
+ * Version: 1.6.0
  * Author: Itajaitech
  */
 
@@ -10,10 +10,18 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('NSR_PLUGIN_VERSION', '1.5.8');
+define('NSR_PLUGIN_VERSION', '1.6.0');
 define('NSR_PLUGIN_SLUG', 'ns-rastreio');
 require_once __DIR__ . '/includes/batch-search.php';
 require_once __DIR__ . '/includes/product-catalog.php';
+
+add_action('admin_enqueue_scripts', function () {
+    if (!isset($_GET['page']) || $_GET['page'] !== NSR_PLUGIN_SLUG) return;
+    wp_enqueue_style('nsr-mobile', plugins_url('assets/mobile.css', __FILE__), array(), NSR_PLUGIN_VERSION);
+    wp_enqueue_script('nsr-jsqr', plugins_url('assets/jsQR.js', __FILE__), array(), '1.4.0', true);
+    wp_enqueue_script('nsr-mobile-camera', plugins_url('assets/mobile-camera.js', __FILE__), array('nsr-jsqr'), NSR_PLUGIN_VERSION, true);
+    wp_enqueue_script('nsr-mobile-layout', plugins_url('assets/mobile-layout.js', __FILE__), array(), NSR_PLUGIN_VERSION, true);
+});
 
 /**
  * Extrai NSs individuais de uma celula que pode conter texto misto.
@@ -5856,7 +5864,7 @@ function nsr_render_admin_page() {
 
         <section id="nsr-section-pdf" class="nsr-panel" data-nsr-panel="bipagem"<?php echo $active_tab !== 'bipagem' ? ' hidden' : ''; ?>>
         <h2>Bipagem de numeros de serie</h2>
-        <p>Envie o PDF do pedido para extrair SKU e quantidade. Depois, realize a bipagem dos NS por SKU.</p>
+        <p>Envie o PDF do pedido ou XML da NF-e para extrair SKU e quantidade. No celular, selecione o arquivo salvo em Arquivos ou Downloads. Depois, realize a bipagem dos NS por SKU.</p>
 
         <details style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;"<?php echo isset($_GET['nsr_saved_search']) || isset($_GET['nsr_saved_page']) || isset($_POST['nsr_delete_saved_scan_submit']) ? ' open' : ''; ?>>
             <summary style="cursor:pointer;font-weight:600;">Bipagens salvas (<?php echo esc_html((string) $saved_total); ?> encontradas)</summary>
@@ -5921,7 +5929,7 @@ function nsr_render_admin_page() {
         </form>
         <p style="margin-top:-10px;color:#666;font-size:12px;">Aceita PDF do pedido de venda ou XML da NF-e (NF-e 4.0).</p>
 
-        <details style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;" open>
+        <details data-mobile-collapse style="margin-bottom:16px;border:1px solid #dcdcde;border-radius:6px;padding:12px;" open>
             <summary style="cursor:pointer;font-weight:600;">Inserir itens manualmente (use quando o PDF e imagem/scan)</summary>
             <p style="margin-top:8px;color:#555;">Digite um item por linha no formato: <code>SKU;QUANTIDADE</code><br>
             Separadores aceitos: <code>;</code> <code>|</code> <code>,</code> ou TAB. Linhas com <code>#</code> sao ignoradas.</p>
@@ -5962,6 +5970,7 @@ function nsr_render_admin_page() {
 
                 <!-- Tabela de SKUs clicavel -->
                 <p>Edite os itens abaixo. Para substituir um NS, clique no numero com &times; e bipe novamente. Use <strong>Rebipar SKU</strong> para limpar todos os NS do item. As alteracoes entram na base ao clicar em <strong>Finalizar e salvar NS</strong>.</p>
+                <details data-mobile-collapse class="nsr-optional" open><summary>Adicionar produto ao pedido</summary>
                 <form method="post" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:16px;">
                     <input type="hidden" name="nsr_scan_session_token" value="<?php echo esc_attr($scan_token); ?>" />
                     <?php wp_nonce_field('nsr_scan_action', 'nsr_scan_nonce'); ?>
@@ -5970,6 +5979,8 @@ function nsr_render_admin_page() {
                     <label>Quantidade<br><input type="number" name="nsr_item_qty" min="1" max="50000" value="1" required style="width:90px;" /></label>
                     <button class="button" name="nsr_edit_item" value="add">Adicionar SKU</button>
                 </form>
+                </details>
+                <div class="nsr-table-scroll" role="region" aria-label="Itens da bipagem; deslize para ver todas as colunas" tabindex="0">
                 <table class="widefat" id="nsr-sku-table" style="margin-bottom:14px;cursor:pointer;">
                     <thead>
                         <tr>
@@ -6025,6 +6036,7 @@ function nsr_render_admin_page() {
                                     <?php endforeach; ?>
                                 </td>
                                 <td onclick="event.stopPropagation();">
+                                    <details data-mobile-collapse class="nsr-item-edit" open><summary>Editar este produto</summary>
                                     <form method="post" onsubmit="var a=event.submitter ? event.submitter.value : 'quantity'; return a === 'quantity' || confirm(a === 'remove' ? 'Tem certeza que deseja excluir este SKU e seus NS da sessao?' : 'Tem certeza que deseja limpar os NS deste SKU para bipar novamente?');">
                                         <input type="hidden" name="nsr_scan_session_token" value="<?php echo esc_attr($scan_token); ?>" />
                                         <input type="hidden" name="nsr_item_sku" value="<?php echo esc_attr($sku); ?>" />
@@ -6034,15 +6046,18 @@ function nsr_render_admin_page() {
                                         <button class="button button-small" name="nsr_edit_item" value="reset" formnovalidate>Rebipar SKU</button>
                                         <button class="button button-small" name="nsr_edit_item" value="remove" formnovalidate style="color:#b32d2e;">Excluir SKU</button>
                                     </form>
+                                    </details>
                                 </td>
                             </tr>
                         <?php endforeach; ?>
                     </tbody>
                 </table>
 
+                </div>
                 <!-- Painel de bipagem AJAX -->
-                <div style="background:#f6f7f7;border:1px solid #dcdcde;border-radius:6px;padding:14px;margin-bottom:12px;">
-                    <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:10px;">
+                <div class="nsr-entry" style="background:#f6f7f7;border:1px solid #dcdcde;border-radius:6px;padding:14px;margin-bottom:12px;">
+                    <h3 class="nsr-mobile-title">Bipar no produto selecionado</h3>
+                    <div class="nsr-entry-fields" style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:10px;">
                         <label style="display:flex;flex-direction:column;gap:3px;font-size:13px;">
                             Pedido
                             <input type="text" id="nsr-inp-pedido" value="<?php echo esc_attr(isset($scan_session['pedido']) ? $scan_session['pedido'] : ''); ?>" style="width:120px;" />
@@ -6081,11 +6096,24 @@ function nsr_render_admin_page() {
                         Dica: informe o primeiro NS em <strong>Numero de Serie (NS)</strong>, defina a <strong>Qtd sequencial</strong> e clique em <strong>Gerar sequencial</strong>.
                     </p>
 
-                    <div id="nsr-scan-feedback" style="min-height:28px;font-weight:600;padding:4px 8px;border-radius:4px;display:none;"></div>
+                    <div id="nsr-camera" class="nsr-camera">
+                        <strong>Ler QR code com a camera</strong>
+                        <p>A leitura usa o SKU selecionado acima. Confira os NS antes de registrar; depois, toque em Abrir camera para ler a proxima etiqueta.</p>
+                        <div class="nsr-camera-actions">
+                            <button type="button" class="button" data-start>Abrir camera</button>
+                            <button type="button" class="button" data-stop>Fechar camera</button>
+                        </div>
+                        <video autoplay muted playsinline hidden aria-label="Camera para leitura de QR code"></video>
+                        <label for="nsr-camera-preview">NS lidos (voce pode corrigir antes de registrar)</label>
+                        <textarea id="nsr-camera-preview" spellcheck="false" placeholder="Numeros de serie do QR code"></textarea>
+                        <button type="button" class="button button-primary" data-confirm disabled>Registrar NS no SKU selecionado</button>
+                        <p role="status" aria-live="polite">O site precisa estar em HTTPS. Permita o acesso a camera quando solicitado.</p>
+                    </div>
+                    <div id="nsr-scan-feedback" role="status" aria-live="polite" style="min-height:28px;font-weight:600;padding:4px 8px;border-radius:4px;display:none;"></div>
                 </div>
 
                 <!-- Botoes finalizar/cancelar -->
-                <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                <div class="nsr-session-actions" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
                     <button type="button" class="button" id="nsr-btn-send-tiny-kdt" onclick="nsrSendTiny('kdt')">
                         Enviar NS ao Tiny KDT
                     </button>
@@ -6135,7 +6163,7 @@ function nsr_render_admin_page() {
                     if(badge) badge.style.opacity = '1';
                     activeSku = row.dataset.sku;
                     document.getElementById('nsr-inp-sku').value = activeSku;
-                    document.getElementById('nsr-inp-ns').focus();
+                    if (!window.matchMedia('(pointer: coarse)').matches) document.getElementById('nsr-inp-ns').focus();
                 };
 
                 // Auto-select first SKU that's not done
