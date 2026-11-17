@@ -20,7 +20,7 @@ function nsr_find_batch_serials($serials) {
     foreach (array_chunk(array_keys($serials), 100) as $chunk) {
         $placeholders = implode(',', array_fill(0, count($chunk), '%s'));
         $sql = $wpdb->prepare(
-            'SELECT ns_normalizado, ns, nota_fiscal, pedido, sku, descricao, data_venda FROM ' . nsr_get_table_name() .
+            'SELECT ns_normalizado, ns, nota_fiscal, pedido, sku, descricao, data_venda, origem_arquivo FROM ' . nsr_get_table_name() .
             " WHERE ns_normalizado IN ($placeholders) ORDER BY updated_at DESC, id DESC",
             $chunk
         );
@@ -33,6 +33,24 @@ function nsr_find_batch_serials($serials) {
             if (isset($groups[$key])) {
                 $groups[$key][] = $row;
             }
+        }
+    }
+
+    // Apenas NS ausentes localmente consultam o Keepdata. Quando encontrados,
+    // sao persistidos e as proximas consultas usam exclusivamente a base local.
+    foreach ($groups as $key => $rows) {
+        if (!empty($rows)) {
+            continue;
+        }
+        if (!function_exists('nsr_keepdata_fetch_and_cache')) {
+            continue;
+        }
+        $cached = nsr_keepdata_fetch_and_cache($serials[$key]);
+        if (is_wp_error($cached)) {
+            return $cached;
+        }
+        if (is_array($cached)) {
+            $groups[$key] = nsr_enrich_product_records(array($cached));
         }
     }
     return $groups;
@@ -89,7 +107,7 @@ function nsr_render_batch_search($context) {
             } else {
                 $groups = nsr_find_batch_serials($serials);
                 if (is_wp_error($groups)) {
-                    $error = $groups->get_error_message();
+                    $error = 'Falha na consulta PY: ' . $groups->get_error_message();
                     $groups = null;
                 }
             }
@@ -116,14 +134,14 @@ function nsr_render_batch_search($context) {
             <p>Expiracao: data da compra/nota fiscal + 2 anos. Todas as notas encontradas para cada NS aparecem abaixo.</p>
             <div style="overflow-x:auto;">
             <table class="widefat striped" style="width:100%;text-align:left;">
-                <thead><tr><th>NS consultado</th><th>Resultado</th><th>NS encontrado</th><th>Nota fiscal</th><th>Pedido</th><th>SKU</th><th>Descricao</th><th>GTIN/EAN</th><th>Data de venda</th><th>Expiracao</th></tr></thead>
+                <thead><tr><th>NS consultado</th><th>Resultado</th><th>Origem</th><th>NS encontrado</th><th>Nota fiscal</th><th>Pedido</th><th>SKU</th><th>Descricao</th><th>GTIN/EAN</th><th>Data de venda</th><th>Expiracao</th></tr></thead>
                 <tbody>
                 <?php foreach ($groups as $key => $rows) : ?>
                     <?php if (!$rows) : ?>
-                        <tr><td><?php echo esc_html($serials[$key]); ?></td><td>Nao encontrado</td><td colspan="8">&mdash;</td></tr>
+                        <tr><td><?php echo esc_html($serials[$key]); ?></td><td>Nao encontrado no BR nem no PY</td><td>&mdash;</td><td colspan="8">&mdash;</td></tr>
                     <?php else : foreach ($rows as $row) : ?>
                         <tr>
-                            <td><?php echo esc_html($serials[$key]); ?></td><td>Encontrado</td>
+                            <td><?php echo esc_html($serials[$key]); ?></td><td>Encontrado</td><td><strong><?php echo esc_html(nsr_record_origin_label($row)); ?></strong></td>
                             <?php foreach (array('ns', 'nota_fiscal', 'pedido', 'sku', 'descricao', 'gtin', 'data_venda') as $column) : ?>
                                 <td><?php echo esc_html($row[$column] !== '' ? ($column === 'data_venda' ? nsr_format_sale_date($row[$column]) : $row[$column]) : 'Nao informado'); ?></td>
                             <?php endforeach; ?>

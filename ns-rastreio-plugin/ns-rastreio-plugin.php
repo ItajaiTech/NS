@@ -2,7 +2,7 @@
 /*
  * Plugin Name: NS Rastreio
  * Description: Importa planilhas Excel/CSV para consultar NS e encontrar numero da NF ou numero do pedido.
- * Version: 1.6.0
+ * Version: 1.6.3
  * Author: Itajaitech
  */
 
@@ -10,10 +10,11 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('NSR_PLUGIN_VERSION', '1.6.0');
+define('NSR_PLUGIN_VERSION', '1.6.3');
 define('NSR_PLUGIN_SLUG', 'ns-rastreio');
 require_once __DIR__ . '/includes/batch-search.php';
 require_once __DIR__ . '/includes/product-catalog.php';
+require_once __DIR__ . '/includes/keepdata.php';
 
 add_action('admin_enqueue_scripts', function () {
     if (!isset($_GET['page']) || $_GET['page'] !== NSR_PLUGIN_SLUG) return;
@@ -2798,7 +2799,15 @@ function nsr_find_admin_records($value, $search_type = 'ns', $partial = false, $
     $limit = max(1, min(absint($limit), 500));
 
     if ($search_type === 'ns') {
-        return nsr_find_by_ns($value_raw, $partial, $limit);
+        $records = nsr_find_by_ns($value_raw, $partial, $limit);
+        if ($partial || !empty($records) || !function_exists('nsr_keepdata_fetch_and_cache')) {
+            return $records;
+        }
+        $cached = nsr_keepdata_fetch_and_cache($value_raw);
+        if (is_wp_error($cached)) {
+            return $cached;
+        }
+        return is_array($cached) ? nsr_find_by_ns($value_raw, false, $limit) : array();
     }
 
     $column = ($search_type === 'nf') ? 'nota_fiscal' : 'pedido';
@@ -5686,6 +5695,7 @@ function nsr_render_admin_page() {
     $messages = nsr_merge_messages($messages, nsr_handle_products_import_submission());
     $messages = nsr_merge_messages($messages, nsr_handle_product_manual_submission());
     $messages = nsr_merge_messages($messages, nsr_handle_tiny_tokens_submission());
+    $messages = nsr_merge_messages($messages, nsr_handle_keepdata_settings_submission());
     $pdf_workflow = nsr_handle_pdf_scan_workflow_submission();
     $messages = nsr_merge_messages($messages, $pdf_workflow['messages']);
     $scan_session = isset($pdf_workflow['session']) && is_array($pdf_workflow['session']) ? $pdf_workflow['session'] : null;
@@ -5745,7 +5755,7 @@ function nsr_render_admin_page() {
         'consulta' => 'Consultar NS',
         'produtos' => 'Produtos',
         'arquivos' => 'Importar / Exportar',
-        'tiny' => 'Integracao Tiny',
+        'tiny' => 'Integracoes',
     );
     $active_tab = isset($_POST['nsr_tab']) ? sanitize_key(wp_unslash($_POST['nsr_tab'])) : (isset($_GET['nsr_tab']) ? sanitize_key(wp_unslash($_GET['nsr_tab'])) : 'bipagem');
     if (!isset($panel_tabs[$active_tab])) {
@@ -5760,8 +5770,13 @@ function nsr_render_admin_page() {
     $admin_search_label = $admin_search_label_map[$admin_search_type];
     $admin_is_partial = (isset($_GET['nsr_admin_partial']) && $_GET['nsr_admin_partial'] === '1');
     $admin_results = array();
+    $admin_search_error = '';
     if ($admin_search_value !== '') {
         $admin_results = nsr_find_admin_records($admin_search_value, $admin_search_type, $admin_is_partial, 200);
+        if (is_wp_error($admin_results)) {
+            $admin_search_error = $admin_results->get_error_message();
+            $admin_results = array();
+        }
     }
     ?>
     <div class="wrap nsr-admin">
@@ -5839,6 +5854,8 @@ function nsr_render_admin_page() {
         </section>
 
         <section id="nsr-section-tiny" class="nsr-panel" data-nsr-panel="tiny"<?php echo $active_tab !== 'tiny' ? ' hidden' : ''; ?>>
+        <h2>Integracoes</h2>
+        <?php nsr_render_keepdata_settings(); ?>
         <h2>Integracao Tiny</h2>
         <p>Configure um token para cada sistema Tiny: KDT, TEKE e TECH. O envio de NS sera feito manualmente e separado por sistema.</p>
         <form method="post" style="margin-bottom:24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;max-width:820px;">
@@ -6624,12 +6641,17 @@ function nsr_render_admin_page() {
 
         <?php if ($admin_search_value !== '') : ?>
             <div style="margin-top:12px;">
-                <?php if (!empty($admin_results)) : ?>
+                <?php if ($admin_search_error !== '') : ?>
+                    <div style="padding:12px;background:#f8d7da;border:1px solid #dc3545;border-radius:4px;color:#842029;">
+                        <strong>Falha na consulta PY</strong><br/><?php echo esc_html($admin_search_error); ?>
+                    </div>
+                <?php elseif (!empty($admin_results)) : ?>
                     <p><strong><?php echo esc_html((string) count($admin_results)); ?></strong> resultado(s) encontrado(s).</p>
                     <table class="widefat striped" style="max-width:100%;font-size:13px;">
                         <thead>
                             <tr>
                                 <th>NS</th>
+                                <th>Origem</th>
                                 <th>NF</th>
                                 <th>Pedido</th>
                                 <th>SKU</th>
@@ -6645,6 +6667,7 @@ function nsr_render_admin_page() {
                             <?php foreach ($admin_results as $admin_result) : ?>
                                 <tr>
                                     <td><?php echo esc_html($admin_result['ns']); ?></td>
+                                    <td><strong><?php echo esc_html(nsr_record_origin_label($admin_result)); ?></strong></td>
                                     <td><?php echo esc_html($admin_result['nota_fiscal']); ?></td>
                                     <td><?php echo esc_html($admin_result['pedido']); ?></td>
                                     <td><?php echo esc_html($admin_result['sku']); ?></td>
@@ -6660,7 +6683,7 @@ function nsr_render_admin_page() {
                     </table>
                 <?php else : ?>
                     <div style="padding:12px;background-color:#fff3cd;border:1px solid #ffc107;border-radius:4px;margin-top:8px;color:#856404;">
-                        <strong>⚠ <?php echo esc_html($admin_search_label); ?> não encontrado</strong><br/>
+                        <strong>⚠ <?php echo esc_html($admin_search_label); ?> não encontrado no BR nem no PY</strong><br/>
                         Nenhum resultado encontrado para <?php echo esc_html($admin_search_label); ?>: <strong><?php echo esc_html($admin_search_value); ?></strong>
                         <br/><small style="display:block;margin-top:6px;">Verifique o valor digitado ou marque "Busca parcial" para procurar por trecho.</small>
                     </div>
